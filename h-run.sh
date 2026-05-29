@@ -22,15 +22,20 @@ echo "Pool:   ${POOL}"
 echo "Wallet: ${WALLET:0:20}..."
 echo "Worker: ${WORKER}"
 
-# Устанавливаем зависимости — всё из локальных файлов, без интернета и apt
+# Устанавливаем зависимости — распаковываем wheels напрямую, pip не нужен
 if ! python3 -c "import blake3, numpy" 2>/dev/null; then
     echo "Устанавливаю зависимости..."
-    if ! python3 -m pip --version &>/dev/null; then
-        echo "Устанавливаю pip..."
-        python3 "${MINER_DIR}/get-pip.py" --quiet
-    fi
-    python3 -m pip install -q --no-index --find-links="${MINER_DIR}/wheels" blake3 numpy
-    echo "Зависимости установлены."
+    python3 - <<'PYEOF'
+import zipfile, site, os, sys
+wheels_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wheels")
+site_dir = site.getsitepackages()[0]
+for f in sorted(os.listdir(wheels_dir)):
+    if f.endswith(".whl"):
+        print(f"  {f}")
+        with zipfile.ZipFile(os.path.join(wheels_dir, f)) as z:
+            z.extractall(site_dir)
+print("Готово.")
+PYEOF
 fi
 
 exec python3 "${MINER_DIR}/miner.py" \
