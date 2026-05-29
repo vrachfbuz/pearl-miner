@@ -22,14 +22,15 @@ echo "Pool:   ${POOL}"
 echo "Wallet: ${WALLET:0:20}..."
 echo "Worker: ${WORKER}"
 
-# Устанавливаем зависимости из локальных wheels (без интернета)
+# Устанавливаем зависимости — всё из локальных файлов, без интернета и apt
 if ! python3 -c "import blake3, numpy" 2>/dev/null; then
     echo "Устанавливаю зависимости..."
-    if ! command -v pip3 &>/dev/null; then
-        PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-        curl -sS "https://bootstrap.pypa.io/pip/${PY_VER}/get-pip.py" | python3
+    if ! python3 -m pip --version &>/dev/null; then
+        echo "Устанавливаю pip..."
+        python3 "${MINER_DIR}/get-pip.py" --quiet
     fi
-    pip3 install -q --no-index --find-links="${MINER_DIR}/wheels" blake3 numpy
+    python3 -m pip install -q --no-index --find-links="${MINER_DIR}/wheels" blake3 numpy
+    echo "Зависимости установлены."
 fi
 
 exec python3 "${MINER_DIR}/miner.py" \
