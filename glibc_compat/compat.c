@@ -225,7 +225,7 @@ __asm__(".symver __compat_libc_start_main,__libc_start_main@GLIBC_2.34");
  * We forward to the glibc 2.31 versions (__xstat/__fxstat). */
 extern int __xstat(int ver, const char *path, struct stat *buf);
 extern int __fxstat(int ver, int fd, struct stat *buf);
-#define _STAT_VER 1
+/* _STAT_VER already defined in <bits/stat.h> as _STAT_VER_LINUX */
 
 int __compat_stat(const char *path, struct stat *buf) {
     return __xstat(_STAT_VER, path, buf);
