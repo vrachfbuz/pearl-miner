@@ -85,11 +85,13 @@ seed   = params["seed"]
 diff   = int(params.get("difficulty", 32))
 print(f"\nCHALLENGE seed={seed[:24]}... diff={diff}\n", flush=True)
 
-# --- Тест: отправить digest=0x00..01 (заведомо < любого target) ---
-# Если пул примет → он проверяет только числовое значение (слабая проверка)
-# Если отклонит  → он проверяет правильность NoisyGEMM
-print("ШАГ 1: отправляю digest=0x000...01 (минимальный, точно < target)", flush=True)
-send_raw("pearl.submit", {"seed": seed, "tile_i": 0, "tile_j": 0, "digest": "00"*31 + "01"})
+# --- Тест: digest = 1 в little-endian (МИНИМАЛЬНО возможный, точно < любого target) ---
+# "01"+"00"*31 → int.from_bytes(..., "little") = 1 (меньше любого target)
+# "00"*31+"01" → int.from_bytes(..., "little") = 2^248 (БОЛЬШЕ target=2^239 — неверно!)
+# Если пул примет → проверяет только числовое значение (без NoisyGEMM)
+# Если отклонит  → проверяет правильность NoisyGEMM digest
+print("ШАГ 1: digest=1 (little-endian) — точно < target, но НЕ NoisyGEMM", flush=True)
+send_raw("pearl.submit", {"seed": seed, "tile_i": 0, "tile_j": 0, "digest": "01" + "00"*31})
 msgs = recv_msgs(count=3, timeout=15)
 for m_obj in msgs:
     r_seed = m_obj.get("params", {}).get("seed", "")
