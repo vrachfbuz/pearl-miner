@@ -83,18 +83,20 @@ def noisy_gemm_mine(sigma, m, n, k, r, tm, tn, b):
 
     raw_EL = blake3_stream(sA, b"EL", m * r)
     EL = ((np.frombuffer(raw_EL, dtype=np.uint8).astype(np.int64) % 64) - 32).reshape(m, r)
-    raw_ER = blake3_stream(sA, b"ER", r * 8)
+    # ER: shape (r, k) — choice_matrix(sA, rows=r, cols=k)
+    raw_ER = blake3_stream(sA, b"ER", k * 8)
     ER = np.zeros((r, k), dtype=np.int64)
-    for c in range(r):
-        a = raw_ER[c*8] % k; d = raw_ER[c*8+1] % k
-        if d == a: d = (d+1) % k
+    for c in range(k):
+        a = raw_ER[c*8] % r; d = raw_ER[c*8+1] % r
+        if d == a: d = (d+1) % r
         ER[a, c] += 1; ER[d, c] -= 1
 
-    raw_FL = blake3_stream(sB, b"ER", k * 8)
+    # FL: shape (k, r) — choice_matrix(sB, rows=k, cols=r)
+    raw_FL = blake3_stream(sB, b"ER", r * 8)
     FL = np.zeros((k, r), dtype=np.int64)
-    for c in range(k):
-        a = raw_FL[c*8] % r; d = raw_FL[c*8+1] % r
-        if d == a: d = (d+1) % r
+    for c in range(r):
+        a = raw_FL[c*8] % k; d = raw_FL[c*8+1] % k
+        if d == a: d = (d+1) % k
         FL[a, c] += 1; FL[d, c] -= 1
     raw_FR = blake3_stream(sB, b"EL", r * n)
     FR = ((np.frombuffer(raw_FR, dtype=np.uint8).astype(np.int64) % 64) - 32).reshape(r, n)
