@@ -25,17 +25,17 @@ echo "Worker: ${WORKER}"
 # Устанавливаем зависимости — распаковываем wheels напрямую, pip не нужен
 if ! python3 -c "import blake3, numpy" 2>/dev/null; then
     echo "Устанавливаю зависимости..."
-    python3 - <<'PYEOF'
-import zipfile, site, os, sys
-wheels_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wheels")
+    python3 -c "
+import zipfile, site, os
+wheels_dir = '${MINER_DIR}/wheels'
 site_dir = site.getsitepackages()[0]
 for f in sorted(os.listdir(wheels_dir)):
-    if f.endswith(".whl"):
-        print(f"  {f}")
+    if f.endswith('.whl'):
+        print('  ' + f)
         with zipfile.ZipFile(os.path.join(wheels_dir, f)) as z:
             z.extractall(site_dir)
-print("Готово.")
-PYEOF
+print('Готово.')
+"
 fi
 
 exec python3 "${MINER_DIR}/miner.py" \
