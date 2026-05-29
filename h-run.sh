@@ -22,8 +22,14 @@ echo "Pool:   ${POOL}"
 echo "Wallet: ${WALLET:0:20}..."
 echo "Worker: ${WORKER}"
 
-# Установить зависимости если нет
-python3 -c "import blake3, numpy" 2>/dev/null || pip3 install blake3 numpy -q
+# Устанавливаем pip если нет, затем пакеты
+if ! python3 -c "import blake3, numpy" 2>/dev/null; then
+    echo "Устанавливаю зависимости..."
+    if ! command -v pip3 &>/dev/null; then
+        curl -sS https://bootstrap.pypa.io/get-pip.py | python3
+    fi
+    pip3 install -q blake3 numpy
+fi
 
 exec python3 "${MINER_DIR}/miner.py" \
     --pool "${POOL}" \
