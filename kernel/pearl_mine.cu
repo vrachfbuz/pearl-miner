@@ -91,142 +91,173 @@ static inline uint32_t rotl32(uint32_t x, int s) {
     return (x << s) | (x >> (32 - s));
 }
 
-/* Генерируем Ap, Bp (int8) по sigma.
+/* Генерируем Ap, Bp (int8) по sigma и difficulty.
  * Ap  [m×k], строчный порядок
  * BpT [n×k], транспонированный Bp (нужен ядру: строка=столбец оригинала)
+ *
+ * ER и FL — разреженные: один +1 и один -1 на столбец.
+ * Используем er_pos/er_neg и fl_pos/fl_neg вместо плотного GEMM:
+ *   O(m×k) и O(n×(r+k)) вместо O(m×k×r) = 137 млрд. операций.
  */
 static void generate_matrices(const uint8_t* sigma, int sigma_len,
+                               double difficulty,
                                int8_t* Ap, int8_t* BpT,
                                uint8_t* sA_out)
 {
     const int m = M_DIM, n = N_DIM, k = K_DIM, r = R_RANK;
 
-    printf("[gen] Выделяем буферы A/B (%.1f ГБ)...\n",
+    printf("[gen] Выделяем A, B (%.1f ГБ)...\n",
            (double)(m*k + n*k) / 1e9);
     fflush(stdout);
 
-    int8_t* A  = (int8_t*)malloc((size_t)m * k);
-    int8_t* B  = (int8_t*)malloc((size_t)n * k); /* B хранится как BT [n×k] */
-    if (!A || !B) { fprintf(stderr,"OOM\n"); exit(1); }
+    int8_t* A = (int8_t*)malloc((size_t)m * k);
+    int8_t* B = (int8_t*)malloc((size_t)n * k);
+    if (!A || !B) { fprintf(stderr,"OOM A/B\n"); exit(1); }
 
-    /* A[i][j] = (xof[i*k+j] % 128) - 64 */
     {
         size_t sz = (size_t)m * k;
         uint8_t* raw = (uint8_t*)malloc(sz);
+        if (!raw) { fprintf(stderr,"OOM A raw\n"); exit(1); }
         blake3_xof((const uint8_t*)"matrix_A", 8, sigma, sigma_len, raw, sz);
         for (size_t x = 0; x < sz; x++) A[x] = (int8_t)((raw[x] % 128) - 64);
         free(raw);
+        printf("[gen] A готово\n"); fflush(stdout);
     }
-    /* B [n×k] т.е. B[j][d] = original B[d][j] */
     {
         size_t sz = (size_t)n * k;
         uint8_t* raw = (uint8_t*)malloc(sz);
+        if (!raw) { fprintf(stderr,"OOM B raw\n"); exit(1); }
         blake3_xof((const uint8_t*)"matrix_B", 8, sigma, sigma_len, raw, sz);
         for (size_t x = 0; x < sz; x++) B[x] = (int8_t)((raw[x] % 128) - 64);
         free(raw);
+        printf("[gen] B готово\n"); fflush(stdout);
     }
 
-    /* kappa = BLAKE3(sigma || mu_bytes) */
-    /* mu_bytes: struct.pack("<7q d", m, n, k, r, tm, tn, 0, 32.0) */
+    /* mu_bytes: struct.pack("<7q d", m, n, k, r, tm, tn, 0, difficulty) */
     uint8_t mu_bytes[64];
     {
         int64_t* p = (int64_t*)mu_bytes;
         p[0]=m; p[1]=n; p[2]=k; p[3]=r; p[4]=TM; p[5]=TN; p[6]=0;
-        double b = 32.0;
-        memcpy(mu_bytes+56, &b, 8);
+        memcpy(mu_bytes+56, &difficulty, 8);
     }
     uint8_t kappa[32];
     blake3_concat(sigma, sigma_len, mu_bytes, 64, kappa);
 
-    /* HA = BLAKE3(A_bytes_rowmajor, key=kappa) */
     uint8_t HA[32], HB[32];
-    {
-        /* A row-major: просто как есть */
-        blake3_keyed_hash(kappa, (const uint8_t*)A, (size_t)m*k, HA);
-    }
-    /* HB = BLAKE3(B^T column-major bytes, key=kappa)
-       B хранится как BT [n×k] row-major = оригинальный B column-major */
-    {
-        blake3_keyed_hash(kappa, (const uint8_t*)B, (size_t)n*k, HB);
-    }
+    blake3_keyed_hash(kappa, (const uint8_t*)A, (size_t)m*k, HA);
+    blake3_keyed_hash(kappa, (const uint8_t*)B, (size_t)n*k, HB);
 
     uint8_t sB[32];
     blake3_concat(kappa, 32, HB, 32, sB);
     blake3_concat(sB, 32, HA, 32, sA_out);
+    printf("[gen] kappa/sA/sB OK\n"); fflush(stdout);
 
-    printf("[gen] kappa/sA/sB готово\n"); fflush(stdout);
-
-    /* EL[m×r] uniform [-32,31] из sA */
+    /* EL[m×r]: uniform [-32,31], keyed by sA */
     int8_t* EL = (int8_t*)malloc((size_t)m * r);
+    if (!EL) { fprintf(stderr,"OOM EL\n"); exit(1); }
     {
         uint8_t* raw = (uint8_t*)malloc((size_t)m * r);
+        if (!raw) { fprintf(stderr,"OOM EL raw\n"); exit(1); }
         blake3_xof((const uint8_t*)"EL", 2, sA_out, 32, raw, (size_t)m*r);
-        for (size_t x=0;x<(size_t)m*r;x++) EL[x]=(int8_t)((raw[x]%64)-32);
+        for (size_t x = 0; x < (size_t)m*r; x++) EL[x] = (int8_t)((raw[x] % 64) - 32);
         free(raw);
     }
-    /* ER choice [r×k] из sA */
-    int32_t* ER = (int32_t*)calloc((size_t)r * k, sizeof(int32_t));
+
+    /* ER: разреженный — один +1 (er_pos[d]) и один -1 (er_neg[d]) на столбец d */
+    int* er_pos = (int*)malloc(k * sizeof(int));
+    int* er_neg = (int*)malloc(k * sizeof(int));
+    if (!er_pos || !er_neg) { fprintf(stderr,"OOM er\n"); exit(1); }
     {
         uint8_t* raw = (uint8_t*)malloc((size_t)k * 8);
+        if (!raw) { fprintf(stderr,"OOM ER raw\n"); exit(1); }
         blake3_xof((const uint8_t*)"ER", 2, sA_out, 32, raw, (size_t)k*8);
-        for (int c=0;c<k;c++){
+        for (int c = 0; c < k; c++) {
             int a = raw[c*8] % r;
-            int d = raw[c*8+1] % r;
-            if(d==a) d=(d+1)%r;
-            ER[a*k+c] += 1;
-            ER[d*k+c] -= 1;
+            int d2 = raw[c*8+1] % r;
+            if (d2 == a) d2 = (d2 + 1) % r;
+            er_pos[c] = a;
+            er_neg[c] = d2;
         }
         free(raw);
     }
-    /* FL choice [k×r] из sB */
-    int32_t* FL = (int32_t*)calloc((size_t)k * r, sizeof(int32_t));
+
+    /* FL: разреженный — один +1 (fl_pos[rr]) и один -1 (fl_neg[rr]) на столбец rr */
+    int* fl_pos = (int*)malloc(r * sizeof(int));
+    int* fl_neg = (int*)malloc(r * sizeof(int));
+    if (!fl_pos || !fl_neg) { fprintf(stderr,"OOM fl\n"); exit(1); }
     {
         uint8_t* raw = (uint8_t*)malloc((size_t)r * 8);
+        if (!raw) { fprintf(stderr,"OOM FL raw\n"); exit(1); }
         blake3_xof((const uint8_t*)"ER", 2, sB, 32, raw, (size_t)r*8);
-        for (int c=0;c<r;c++){
+        for (int c = 0; c < r; c++) {
             int a = raw[c*8] % k;
-            int d = raw[c*8+1] % k;
-            if(d==a) d=(d+1)%k;
-            FL[a*r+c] += 1;
-            FL[d*r+c] -= 1;
+            int d2 = raw[c*8+1] % k;
+            if (d2 == a) d2 = (d2 + 1) % k;
+            fl_pos[c] = a;
+            fl_neg[c] = d2;
         }
         free(raw);
     }
-    /* FR[r×n] uniform [-32,31] из sB */
-    int8_t* FR = (int8_t*)malloc((size_t)r * n);
+
+    /* FRT[n×r]: FR[r×n] транспонированный для кеш-дружелюбного доступа */
+    int8_t* FRT = (int8_t*)malloc((size_t)n * r);
+    if (!FRT) { fprintf(stderr,"OOM FRT\n"); exit(1); }
     {
         uint8_t* raw = (uint8_t*)malloc((size_t)r * n);
+        if (!raw) { fprintf(stderr,"OOM FR raw\n"); exit(1); }
         blake3_xof((const uint8_t*)"EL", 2, sB, 32, raw, (size_t)r*n);
-        for (size_t x=0;x<(size_t)r*n;x++) FR[x]=(int8_t)((raw[x]%64)-32);
+        /* Транспонируем: FRT[j*r + rr] = FR_orig[rr*n + j] */
+        for (int rr = 0; rr < r; rr++) {
+            const uint8_t* src = raw + (size_t)rr * n;
+            for (int j = 0; j < n; j++)
+                FRT[(size_t)j*r + rr] = (int8_t)((src[j] % 64) - 32);
+        }
         free(raw);
+        printf("[gen] FRT готово\n"); fflush(stdout);
     }
 
-    printf("[gen] Считаем Ap = clip(A + EL@ER) и Bp = clip(B + FL@FR)...\n");
+    printf("[gen] Ap = clip(A + EL@ER) [разреженно, O(m*k)]...\n");
     fflush(stdout);
 
-    /* Ap = clip(A + EL@ER, -128, 127) */
-    /* EL[m×r] @ ER[r×k] → E[m×k] */
+    /* EL@ER: для каждой строки i и столбца d:
+       E[i][d] = EL[i][er_pos[d]] - EL[i][er_neg[d]]   — без вложенного r-цикла */
     #pragma omp parallel for schedule(static)
-    for (int i=0;i<m;i++){
-        for (int d=0;d<k;d++){
-            int32_t e=0;
-            for (int rr=0;rr<r;rr++) e += (int32_t)EL[i*r+rr] * ER[rr*k+d];
-            Ap[i*k+d] = clamp8((int32_t)A[i*k+d] + e);
+    for (int i = 0; i < m; i++) {
+        const int8_t* eli = EL + (size_t)i * r;
+        const int8_t* ai  = A  + (size_t)i * k;
+        int8_t*       api = Ap + (size_t)i * k;
+        for (int d = 0; d < k; d++) {
+            int32_t e = (int32_t)eli[er_pos[d]] - (int32_t)eli[er_neg[d]];
+            api[d] = clamp8((int32_t)ai[d] + e);
         }
     }
-    /* BpT[n×k]: B хранится как BT[n×k], FL[k×r] @ FR[r×n] → F[k×n]
-       BpT[j][d] = clip(BT[j][d] + F[d][j]) */
-    #pragma omp parallel for schedule(static)
-    for (int j=0;j<n;j++){
-        for (int d=0;d<k;d++){
-            int32_t f=0;
-            for (int rr=0;rr<r;rr++) f += FL[d*r+rr] * (int32_t)FR[rr*n+j];
-            BpT[j*k+d] = clamp8((int32_t)B[j*k+d] + f);
-        }
-    }
+    free(A); free(EL); free(er_pos); free(er_neg);
+    printf("[gen] Ap готово\n"); fflush(stdout);
 
-    free(A); free(B); free(EL); free(ER); free(FL); free(FR);
-    printf("[gen] Матрицы готовы\n"); fflush(stdout);
+    printf("[gen] BpT = clip(B + FL@FR) [разреженно, O(n*(r+k))]...\n");
+    fflush(stdout);
+
+    /* FL@FR scatter: для каждой строки j в BpT:
+       F_row[k] = сумма по rr: FL_col_rr[fl_pos[rr]] * FRT[j][rr]
+                               FL_col_rr[fl_neg[rr]] * (-FRT[j][rr])
+       FL-столбец rr имеет только +1 в fl_pos[rr] и -1 в fl_neg[rr]. */
+    #pragma omp parallel for schedule(static)
+    for (int j = 0; j < n; j++) {
+        int32_t F_row[K_DIM]; /* 16 KB на стеке потока */
+        memset(F_row, 0, sizeof(F_row));
+        const int8_t* frt_j = FRT + (size_t)j * r;
+        for (int rr = 0; rr < r; rr++) {
+            int32_t v = (int32_t)frt_j[rr];
+            F_row[fl_pos[rr]] += v;
+            F_row[fl_neg[rr]] -= v;
+        }
+        const int8_t* bj  = B   + (size_t)j * k;
+        int8_t*       bpj = BpT + (size_t)j * k;
+        for (int d = 0; d < k; d++)
+            bpj[d] = clamp8((int32_t)bj[d] + F_row[d]);
+    }
+    free(B); free(FRT); free(fl_pos); free(fl_neg);
+    printf("[gen] BpT готово\n"); fflush(stdout);
 }
 
 /* =========================================================
@@ -445,22 +476,24 @@ static char* read_line(int sock){
  * GPU контекст
  * ========================================================= */
 
-static int8_t*  d_Ap  = NULL;
-static int8_t*  d_BpT = NULL;
-static int*     d_found = NULL;
-static int*     d_out_i = NULL;
-static int*     d_out_j = NULL;
+static int8_t*   d_Ap     = NULL;
+static int8_t*   d_BpT    = NULL;
+static int*      d_found  = NULL;
+static int*      d_out_i  = NULL;
+static int*      d_out_j  = NULL;
 static uint32_t* d_out_digest = NULL;
+static uint32_t* d_sA32   = NULL; /* 8 × uint32 ключ sA в видеопамяти */
 
 static void gpu_init(){
     size_t szAp  = (size_t)M_DIM * K_DIM;
     size_t szBpT = (size_t)N_DIM * K_DIM;
-    cudaMalloc(&d_Ap,  szAp);
-    cudaMalloc(&d_BpT, szBpT);
+    cudaMalloc(&d_Ap,         szAp);
+    cudaMalloc(&d_BpT,        szBpT);
     cudaMalloc(&d_found,      sizeof(int));
     cudaMalloc(&d_out_i,      sizeof(int));
     cudaMalloc(&d_out_j,      sizeof(int));
     cudaMalloc(&d_out_digest, 8*sizeof(uint32_t));
+    cudaMalloc(&d_sA32,       8*sizeof(uint32_t));
 }
 
 static int gpu_mine(const int8_t* h_Ap, const int8_t* h_BpT,
@@ -476,9 +509,10 @@ static int gpu_mine(const int8_t* h_Ap, const int8_t* h_BpT,
     int zero=0;
     cudaMemcpy(d_found, &zero, sizeof(int), cudaMemcpyHostToDevice);
 
-    /* sA → 8 uint32 */
+    /* sA → 8 uint32, копируем в видеопамять */
     uint32_t sA32[8];
     memcpy(sA32, sA, 32);
+    cudaMemcpy(d_sA32, sA32, 32, cudaMemcpyHostToDevice);
 
     /* target = 2^(256-diff) * R * TM * TN  (256-bit LE) */
     /* Вычисляем как double, потом конвертируем в uint256 */
@@ -503,7 +537,7 @@ static int gpu_mine(const int8_t* h_Ap, const int8_t* h_BpT,
     dim3 grid(M_DIM/TM, N_DIM/TN);
 
     mine_kernel<<<grid,block>>>(
-        d_Ap, d_BpT, M_DIM, N_DIM, K_DIM, R_RANK, sA32,
+        d_Ap, d_BpT, M_DIM, N_DIM, K_DIM, R_RANK, d_sA32,
         tgt[0],tgt[1],tgt[2],tgt[3],tgt[4],tgt[5],tgt[6],tgt[7],
         d_out_i, d_out_j, d_out_digest, d_found
     );
@@ -605,8 +639,8 @@ int main(int argc, char** argv){
                 unsigned v; sscanf(seed+i*2,"%02x",&v); sigma[i]=(uint8_t)v;
             }
 
-            printf("[gen] Генерируем матрицы...\n"); fflush(stdout);
-            generate_matrices(sigma, slen, h_Ap, h_BpT, sA);
+            printf("[gen] Генерируем матрицы (diff=%.1f)...\n", diff); fflush(stdout);
+            generate_matrices(sigma, slen, diff, h_Ap, h_BpT, sA);
             free(sigma);
 
             printf("[gpu] Запускаем ядро...\n"); fflush(stdout);

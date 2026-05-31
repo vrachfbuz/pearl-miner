@@ -8,7 +8,7 @@ rm -rf "$SRCDIR"
 mkdir -p "$SRCDIR"
 cd "$SRCDIR"
 
-BASE="https://raw.githubusercontent.com/vrachfbuz/pearl-miner/07afb7e"
+BASE="https://raw.githubusercontent.com/vrachfbuz/pearl-miner/main"
 B3="https://raw.githubusercontent.com/BLAKE3-team/BLAKE3/1.5.4/c"
 
 echo "=== Скачиваем исходники майнера ==="
@@ -31,7 +31,7 @@ gcc -O2 -fPIC -c blake3_host.c        -Ib3          -o blake3_host.o
 echo "BLAKE3 OK"
 
 echo "=== Компилируем CUDA ядро (sm_75) ==="
-nvcc -arch=sm_75 -O3 -Xcompiler -fPIC -Ib3 \
+nvcc -arch=sm_75 -O3 -Xcompiler "-fPIC -fopenmp" -Ib3 \
      -c pearl_mine.cu -o pearl_mine.o 2>&1 | grep -v "^$" | grep -v "warning" || true
 echo "CUDA OK"
 
@@ -39,7 +39,7 @@ echo "=== Линкуем pearl_miner ==="
 nvcc -arch=sm_75 -O3 \
      pearl_mine.o blake3_host.o \
      b3/blake3.o b3/blake3_dispatch.o b3/blake3_portable.o \
-     -lcudart -lpthread -lm \
+     -lcudart -lpthread -lm -lgomp \
      -o /tmp/pearl_miner
 
 chmod +x /tmp/pearl_miner
