@@ -484,16 +484,28 @@ static int*      d_out_j  = NULL;
 static uint32_t* d_out_digest = NULL;
 static uint32_t* d_sA32   = NULL; /* 8 × uint32 ключ sA в видеопамяти */
 
+#define CU_CHECK(call) do { \
+    cudaError_t _e = (call); \
+    if(_e != cudaSuccess){ \
+        fprintf(stderr,"[CUDA] %s:%d %s: %s\n",__FILE__,__LINE__,#call,cudaGetErrorString(_e)); \
+        exit(1); \
+    } \
+} while(0)
+
 static void gpu_init(){
     size_t szAp  = (size_t)M_DIM * K_DIM;
     size_t szBpT = (size_t)N_DIM * K_DIM;
-    cudaMalloc(&d_Ap,         szAp);
-    cudaMalloc(&d_BpT,        szBpT);
-    cudaMalloc(&d_found,      sizeof(int));
-    cudaMalloc(&d_out_i,      sizeof(int));
-    cudaMalloc(&d_out_j,      sizeof(int));
-    cudaMalloc(&d_out_digest, 8*sizeof(uint32_t));
-    cudaMalloc(&d_sA32,       8*sizeof(uint32_t));
+    printf("[gpu] cudaMalloc Ap=%.0fMB BpT=%.0fMB...\n",
+           (double)szAp/1e6, (double)szBpT/1e6);
+    fflush(stdout);
+    CU_CHECK(cudaMalloc(&d_Ap,         szAp));
+    CU_CHECK(cudaMalloc(&d_BpT,        szBpT));
+    CU_CHECK(cudaMalloc(&d_found,      sizeof(int)));
+    CU_CHECK(cudaMalloc(&d_out_i,      sizeof(int)));
+    CU_CHECK(cudaMalloc(&d_out_j,      sizeof(int)));
+    CU_CHECK(cudaMalloc(&d_out_digest, 8*sizeof(uint32_t)));
+    CU_CHECK(cudaMalloc(&d_sA32,       8*sizeof(uint32_t)));
+    printf("[gpu] cudaMalloc OK\n"); fflush(stdout);
 }
 
 static int gpu_mine(const int8_t* h_Ap, const int8_t* h_BpT,
@@ -503,16 +515,18 @@ static int gpu_mine(const int8_t* h_Ap, const int8_t* h_BpT,
     size_t szAp  = (size_t)M_DIM * K_DIM;
     size_t szBpT = (size_t)N_DIM * K_DIM;
 
-    cudaMemcpy(d_Ap,  h_Ap,  szAp,  cudaMemcpyHostToDevice);
-    cudaMemcpy(d_BpT, h_BpT, szBpT, cudaMemcpyHostToDevice);
+    printf("[gpu] Копируем Ap/BpT на GPU...\n"); fflush(stdout);
+    CU_CHECK(cudaMemcpy(d_Ap,  h_Ap,  szAp,  cudaMemcpyHostToDevice));
+    CU_CHECK(cudaMemcpy(d_BpT, h_BpT, szBpT, cudaMemcpyHostToDevice));
+    printf("[gpu] Копирование OK\n"); fflush(stdout);
 
     int zero=0;
-    cudaMemcpy(d_found, &zero, sizeof(int), cudaMemcpyHostToDevice);
+    CU_CHECK(cudaMemcpy(d_found, &zero, sizeof(int), cudaMemcpyHostToDevice));
 
     /* sA → 8 uint32, копируем в видеопамять */
     uint32_t sA32[8];
     memcpy(sA32, sA, 32);
-    cudaMemcpy(d_sA32, sA32, 32, cudaMemcpyHostToDevice);
+    CU_CHECK(cudaMemcpy(d_sA32, sA32, 32, cudaMemcpyHostToDevice));
 
     /* target = 2^(256-diff) * R * TM * TN  (256-bit LE) */
     /* Вычисляем как double, потом конвертируем в uint256 */
@@ -536,15 +550,22 @@ static int gpu_mine(const int8_t* h_Ap, const int8_t* h_BpT,
     dim3 block(TN, TM);
     dim3 grid(M_DIM/TM, N_DIM/TN);
 
+    printf("[gpu] grid=(%d,%d) block=(%d,%d) target[7]=0x%08X\n",
+           M_DIM/TM, N_DIM/TN, TN, TM, tgt[7]);
+    fflush(stdout);
+
     mine_kernel<<<grid,block>>>(
         d_Ap, d_BpT, M_DIM, N_DIM, K_DIM, R_RANK, d_sA32,
         tgt[0],tgt[1],tgt[2],tgt[3],tgt[4],tgt[5],tgt[6],tgt[7],
         d_out_i, d_out_j, d_out_digest, d_found
     );
-    cudaDeviceSynchronize();
+    CU_CHECK(cudaGetLastError());
+    printf("[gpu] Ядро запущено, ждём синхронизации...\n"); fflush(stdout);
+    CU_CHECK(cudaDeviceSynchronize());
+    printf("[gpu] Синхронизация OK\n"); fflush(stdout);
 
     int found=0;
-    cudaMemcpy(&found, d_found, sizeof(int), cudaMemcpyDeviceToHost);
+    CU_CHECK(cudaMemcpy(&found, d_found, sizeof(int), cudaMemcpyDeviceToHost));
     if(found){
         cudaMemcpy(found_i,    d_out_i,      sizeof(int),          cudaMemcpyDeviceToHost);
         cudaMemcpy(found_j,    d_out_j,      sizeof(int),          cudaMemcpyDeviceToHost);
@@ -594,7 +615,8 @@ int main(int argc, char** argv){
     }
     if(!wallet){ fprintf(stderr,"--wallet required\n"); return 1; }
 
-    cudaSetDevice(device_id);
+    printf("[main] cudaSetDevice(%d)...\n", device_id); fflush(stdout);
+    CU_CHECK(cudaSetDevice(device_id));
     gpu_init();
 
     printf("[main] Подключаемся к %s:%d...\n",pool_host,pool_port);
