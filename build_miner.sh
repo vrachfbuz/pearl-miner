@@ -7,7 +7,7 @@ SRCDIR=/tmp/pearl_src
 mkdir -p "$SRCDIR"
 cd "$SRCDIR"
 
-BASE="https://raw.githubusercontent.com/vrachfbuz/pearl-miner/master"
+BASE="https://raw.githubusercontent.com/vrachfbuz/pearl-miner/07afb7e"
 
 echo "=== Скачиваем исходники ==="
 wget -q "$BASE/kernel/pearl_mine.cu"    -O pearl_mine.cu
