@@ -1,0 +1,629 @@
+/*
+ * pearl_mine.cu  —  Pearl NoisyGEMM CPU+GPU майнер (sm_75 / CMP 40HX)
+ *
+ * Компиляция:
+ *   nvcc -arch=sm_75 -O3 -Xcompiler -fPIC -I./b3 \
+ *        pearl_mine.cu blake3_host.o b3/blake3*.o \
+ *        -lcudart -lpthread -o pearl_miner
+ *
+ * Запуск:
+ *   ./pearl_miner --pool stratum+tcp://pearl.baikalmine.com:2010 \
+ *                 --wallet prl1... --device 0
+ */
+
+#include <cuda_runtime.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <time.h>
+#include <math.h>
+
+extern "C" {
+#include "b3/blake3.h"
+}
+
+/* =========================================================
+ * BLAKE3 утилиты (CPU)
+ * ========================================================= */
+
+/* XOF: BLAKE3(tag || key).digest(length=n) */
+static void blake3_xof(const uint8_t* tag, int tag_len,
+                       const uint8_t* key, int key_len,
+                       uint8_t* out, size_t out_len)
+{
+    blake3_hasher h;
+    blake3_hasher_init(&h);
+    blake3_hasher_update(&h, tag, tag_len);
+    blake3_hasher_update(&h, key, key_len);
+    blake3_hasher_finalize_seek(&h, 0, out, out_len);
+}
+
+/* BLAKE3(data, key=key) → 32 байта */
+static void blake3_keyed_hash(const uint8_t* key,
+                               const uint8_t* data, size_t data_len,
+                               uint8_t* out32)
+{
+    blake3_hasher h;
+    blake3_hasher_init_keyed(&h, key);
+    blake3_hasher_update(&h, data, data_len);
+    blake3_hasher_finalize(&h, out32, 32);
+}
+
+/* BLAKE3(a || b) → 32 байта */
+static void blake3_concat(const uint8_t* a, int alen,
+                          const uint8_t* b, int blen,
+                          uint8_t* out32)
+{
+    blake3_hasher h;
+    blake3_hasher_init(&h);
+    blake3_hasher_update(&h, a, alen);
+    blake3_hasher_update(&h, b, blen);
+    blake3_hasher_finalize(&h, out32, 32);
+}
+
+/* =========================================================
+ * Генерация матриц (CPU)
+ * Ref: pearl_noisygemm_reference.py / py-pearl-mining
+ * ========================================================= */
+
+#define M_DIM  131072
+#define N_DIM  131072
+#define K_DIM  4096
+#define R_RANK 256
+#define TM     16
+#define TN     16
+
+/* int32 clamp */
+static inline int8_t clamp8(int32_t v) {
+    if (v >  127) return  127;
+    if (v < -128) return -128;
+    return (int8_t)v;
+}
+
+static inline uint32_t rotl32(uint32_t x, int s) {
+    return (x << s) | (x >> (32 - s));
+}
+
+/* Генерируем Ap, Bp (int8) по sigma.
+ * Ap  [m×k], строчный порядок
+ * BpT [n×k], транспонированный Bp (нужен ядру: строка=столбец оригинала)
+ */
+static void generate_matrices(const uint8_t* sigma, int sigma_len,
+                               int8_t* Ap, int8_t* BpT,
+                               uint8_t* sA_out)
+{
+    const int m = M_DIM, n = N_DIM, k = K_DIM, r = R_RANK;
+
+    printf("[gen] Выделяем буферы A/B (%.1f ГБ)...\n",
+           (double)(m*k + n*k) / 1e9);
+    fflush(stdout);
+
+    int8_t* A  = (int8_t*)malloc((size_t)m * k);
+    int8_t* B  = (int8_t*)malloc((size_t)n * k); /* B хранится как BT [n×k] */
+    if (!A || !B) { fprintf(stderr,"OOM\n"); exit(1); }
+
+    /* A[i][j] = (xof[i*k+j] % 128) - 64 */
+    {
+        size_t sz = (size_t)m * k;
+        uint8_t* raw = (uint8_t*)malloc(sz);
+        blake3_xof((const uint8_t*)"matrix_A", 8, sigma, sigma_len, raw, sz);
+        for (size_t x = 0; x < sz; x++) A[x] = (int8_t)((raw[x] % 128) - 64);
+        free(raw);
+    }
+    /* B [n×k] т.е. B[j][d] = original B[d][j] */
+    {
+        size_t sz = (size_t)n * k;
+        uint8_t* raw = (uint8_t*)malloc(sz);
+        blake3_xof((const uint8_t*)"matrix_B", 8, sigma, sigma_len, raw, sz);
+        for (size_t x = 0; x < sz; x++) B[x] = (int8_t)((raw[x] % 128) - 64);
+        free(raw);
+    }
+
+    /* kappa = BLAKE3(sigma || mu_bytes) */
+    /* mu_bytes: struct.pack("<7q d", m, n, k, r, tm, tn, 0, 32.0) */
+    uint8_t mu_bytes[64];
+    {
+        int64_t* p = (int64_t*)mu_bytes;
+        p[0]=m; p[1]=n; p[2]=k; p[3]=r; p[4]=TM; p[5]=TN; p[6]=0;
+        double b = 32.0;
+        memcpy(mu_bytes+56, &b, 8);
+    }
+    uint8_t kappa[32];
+    blake3_concat(sigma, sigma_len, mu_bytes, 64, kappa);
+
+    /* HA = BLAKE3(A_bytes_rowmajor, key=kappa) */
+    uint8_t HA[32], HB[32];
+    {
+        /* A row-major: просто как есть */
+        blake3_keyed_hash(kappa, (const uint8_t*)A, (size_t)m*k, HA);
+    }
+    /* HB = BLAKE3(B^T column-major bytes, key=kappa)
+       B хранится как BT [n×k] row-major = оригинальный B column-major */
+    {
+        blake3_keyed_hash(kappa, (const uint8_t*)B, (size_t)n*k, HB);
+    }
+
+    uint8_t sB[32];
+    blake3_concat(kappa, 32, HB, 32, sB);
+    blake3_concat(sB, 32, HA, 32, sA_out);
+
+    printf("[gen] kappa/sA/sB готово\n"); fflush(stdout);
+
+    /* EL[m×r] uniform [-32,31] из sA */
+    int8_t* EL = (int8_t*)malloc((size_t)m * r);
+    {
+        uint8_t* raw = (uint8_t*)malloc((size_t)m * r);
+        blake3_xof((const uint8_t*)"EL", 2, sA_out, 32, raw, (size_t)m*r);
+        for (size_t x=0;x<(size_t)m*r;x++) EL[x]=(int8_t)((raw[x]%64)-32);
+        free(raw);
+    }
+    /* ER choice [r×k] из sA */
+    int32_t* ER = (int32_t*)calloc((size_t)r * k, sizeof(int32_t));
+    {
+        uint8_t* raw = (uint8_t*)malloc((size_t)k * 8);
+        blake3_xof((const uint8_t*)"ER", 2, sA_out, 32, raw, (size_t)k*8);
+        for (int c=0;c<k;c++){
+            int a = raw[c*8] % r;
+            int d = raw[c*8+1] % r;
+            if(d==a) d=(d+1)%r;
+            ER[a*k+c] += 1;
+            ER[d*k+c] -= 1;
+        }
+        free(raw);
+    }
+    /* FL choice [k×r] из sB */
+    int32_t* FL = (int32_t*)calloc((size_t)k * r, sizeof(int32_t));
+    {
+        uint8_t* raw = (uint8_t*)malloc((size_t)r * 8);
+        blake3_xof((const uint8_t*)"ER", 2, sB, 32, raw, (size_t)r*8);
+        for (int c=0;c<r;c++){
+            int a = raw[c*8] % k;
+            int d = raw[c*8+1] % k;
+            if(d==a) d=(d+1)%k;
+            FL[a*r+c] += 1;
+            FL[d*r+c] -= 1;
+        }
+        free(raw);
+    }
+    /* FR[r×n] uniform [-32,31] из sB */
+    int8_t* FR = (int8_t*)malloc((size_t)r * n);
+    {
+        uint8_t* raw = (uint8_t*)malloc((size_t)r * n);
+        blake3_xof((const uint8_t*)"EL", 2, sB, 32, raw, (size_t)r*n);
+        for (size_t x=0;x<(size_t)r*n;x++) FR[x]=(int8_t)((raw[x]%64)-32);
+        free(raw);
+    }
+
+    printf("[gen] Считаем Ap = clip(A + EL@ER) и Bp = clip(B + FL@FR)...\n");
+    fflush(stdout);
+
+    /* Ap = clip(A + EL@ER, -128, 127) */
+    /* EL[m×r] @ ER[r×k] → E[m×k] */
+    #pragma omp parallel for schedule(static)
+    for (int i=0;i<m;i++){
+        for (int d=0;d<k;d++){
+            int32_t e=0;
+            for (int rr=0;rr<r;rr++) e += (int32_t)EL[i*r+rr] * ER[rr*k+d];
+            Ap[i*k+d] = clamp8((int32_t)A[i*k+d] + e);
+        }
+    }
+    /* BpT[n×k]: B хранится как BT[n×k], FL[k×r] @ FR[r×n] → F[k×n]
+       BpT[j][d] = clip(BT[j][d] + F[d][j]) */
+    #pragma omp parallel for schedule(static)
+    for (int j=0;j<n;j++){
+        for (int d=0;d<k;d++){
+            int32_t f=0;
+            for (int rr=0;rr<r;rr++) f += FL[d*r+rr] * (int32_t)FR[rr*n+j];
+            BpT[j*k+d] = clamp8((int32_t)B[j*k+d] + f);
+        }
+    }
+
+    free(A); free(B); free(EL); free(ER); free(FL); free(FR);
+    printf("[gen] Матрицы готовы\n"); fflush(stdout);
+}
+
+/* =========================================================
+ * CUDA ядро: tiled NoisyGEMM → transcript → проверка target
+ *
+ * Ap  [M×K] int8 row-major
+ * BpT [N×K] int8 row-major (транспонированный Bp)
+ * sA_key32[8] = uint32 LE слова 32-байтного ключа sA
+ *
+ * Каждый блок: один тайл (bi, bj), tm×tn потоков
+ * ========================================================= */
+
+__device__ __forceinline__ uint32_t d_rotl32(uint32_t x, int s){
+    return (x<<s)|(x>>(32-s));
+}
+
+/* BLAKE3 compression (device) */
+__device__ __constant__ uint32_t B3IV[8] = {
+    0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
+    0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u
+};
+
+__device__ __forceinline__ void b3G(uint32_t* v,int a,int b,int c,int d,uint32_t x,uint32_t y){
+    v[a]+=v[b]+x; v[d]=__builtin_rotateright32(v[d]^v[a],16);
+    v[c]+=v[d];   v[b]=__builtin_rotateright32(v[b]^v[c],12);
+    v[a]+=v[b]+y; v[d]=__builtin_rotateright32(v[d]^v[a], 8);
+    v[c]+=v[d];   v[b]=__builtin_rotateright32(v[b]^v[c], 7);
+}
+
+__device__ void b3_compress64(const uint32_t* key8, const uint32_t* msg16,
+                               uint32_t* out8)
+{
+    /* flags = CHUNK_START|CHUNK_END|ROOT|KEYED_HASH = 0x1B */
+    uint32_t v[16]={
+        key8[0],key8[1],key8[2],key8[3],
+        key8[4],key8[5],key8[6],key8[7],
+        B3IV[0],B3IV[1],B3IV[2],B3IV[3],
+        0,0,64u,0x1Bu
+    };
+    uint32_t m[16];
+    for(int i=0;i<16;i++) m[i]=msg16[i];
+
+    /* 7 раундов; после каждого — перестановка MSG_PERMUTATION */
+    static const uint8_t PERM[16]={2,6,3,10,7,0,4,13,1,11,12,5,9,14,15,8};
+    for(int round=0;round<7;round++){
+        b3G(v,0,4, 8,12,m[0], m[1]);
+        b3G(v,1,5, 9,13,m[2], m[3]);
+        b3G(v,2,6,10,14,m[4], m[5]);
+        b3G(v,3,7,11,15,m[6], m[7]);
+        b3G(v,0,5,10,15,m[8], m[9]);
+        b3G(v,1,6,11,12,m[10],m[11]);
+        b3G(v,2,7, 8,13,m[12],m[13]);
+        b3G(v,3,4, 9,14,m[14],m[15]);
+        if(round<6){
+            uint32_t t[16];
+            for(int i=0;i<16;i++) t[i]=m[PERM[i]];
+            for(int i=0;i<16;i++) m[i]=t[i];
+        }
+    }
+    for(int i=0;i<8;i++) out8[i]=v[i]^v[i+8];
+}
+
+/* Ядро майнинга */
+__global__ void mine_kernel(
+    const int8_t* __restrict__ Ap,   /* [M×K] */
+    const int8_t* __restrict__ BpT,  /* [N×K] транспонированный */
+    int M, int N, int K, int R,
+    const uint32_t* __restrict__ sA32, /* 8 uint32 */
+    /* target: 8 uint32 LE (256-бит) */
+    uint32_t t0,uint32_t t1,uint32_t t2,uint32_t t3,
+    uint32_t t4,uint32_t t5,uint32_t t6,uint32_t t7,
+    /* выход */
+    int* out_i, int* out_j, uint32_t* out_digest8,
+    int* found_flag
+){
+    const int ti = (int)blockIdx.x * TM;
+    const int tj = (int)blockIdx.y * TN;
+    if(ti+TM>M || tj+TN>N) return;
+
+    const int row = threadIdx.y; /* 0..TM-1 */
+    const int col = threadIdx.x; /* 0..TN-1 */
+
+    /* Shared: части sub-матрицы для XOR-редукции */
+    __shared__ uint32_t sX[TM*TN]; /* один элемент на поток */
+    __shared__ uint32_t sM[16];    /* transcript */
+    if(threadIdx.x==0 && threadIdx.y==0)
+        for(int i=0;i<16;i++) sM[i]=0u;
+    __syncthreads();
+
+    /* Цикл по r-блокам */
+    int l = 0;
+    for(int s=0; s+R<=K; s+=R, l++){
+        /* Dot product Ap[ti+row, s:s+R] · BpT[tj+col, s:s+R] */
+        int32_t acc=0;
+        int s_end = s+R;
+        for(int d=s; d<s_end; d+=4){
+            /* DP4A: 4 int8 за раз */
+            int va, vb;
+            const int8_t* ap = Ap + (ti+row)*K + d;
+            const int8_t* bp = BpT+ (tj+col)*K + d;
+            memcpy(&va, ap, 4);
+            memcpy(&vb, bp, 4);
+            acc = __dp4a(va, vb, acc);
+        }
+        /* Каждый поток пишет свой acc как uint32 */
+        sX[threadIdx.y*TN + threadIdx.x] = (uint32_t)acc;
+        __syncthreads();
+
+        /* XOR-редукция 256→1, только thread(0,0) */
+        if(threadIdx.x==0 && threadIdx.y==0){
+            uint32_t X=0;
+            for(int i=0;i<TM*TN;i++) X ^= sX[i];
+            uint32_t idx = (uint32_t)(l % 16);
+            sM[idx] = d_rotl32(sM[idx],13) ^ X;
+        }
+        __syncthreads();
+    }
+
+    /* Только один поток выполняет BLAKE3 и проверку */
+    if(threadIdx.x==0 && threadIdx.y==0){
+        /* BLAKE3(sM[0..15], key=sA) */
+        uint32_t digest[8];
+        b3_compress64(sA32, sM, digest);
+
+        /* Сравнение uint256 LE: digest <= target */
+        bool ok = false;
+        uint32_t tgt[8]={t0,t1,t2,t3,t4,t5,t6,t7};
+        for(int w=7;w>=0;w--){
+            if(digest[w] < tgt[w]){ ok=true; break; }
+            if(digest[w] > tgt[w]){ ok=false; break; }
+            if(w==0) ok=true; /* равны */
+        }
+
+        if(ok){
+            if(atomicCAS(found_flag,0,1)==0){
+                *out_i = ti;
+                *out_j = tj;
+                for(int w=0;w<8;w++) out_digest8[w]=digest[w];
+            }
+        }
+    }
+}
+
+/* =========================================================
+ * Stratum клиент (TCP + JSON)
+ * ========================================================= */
+
+static int tcp_sock = -1;
+static char g_seed[128]  = {0};
+static double g_diff      = 32.0;
+static volatile int g_new_job = 0;
+static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+static int tcp_connect(const char* host, int port){
+    struct hostent* he = gethostbyname(host);
+    if(!he){ perror("gethostbyname"); return -1; }
+    int s = socket(AF_INET,SOCK_STREAM,0);
+    struct sockaddr_in sa;
+    sa.sin_family=AF_INET;
+    sa.sin_port=htons(port);
+    memcpy(&sa.sin_addr, he->h_addr_list[0], he->h_length);
+    if(connect(s,(struct sockaddr*)&sa,sizeof(sa))<0){ perror("connect"); close(s); return -1; }
+    return s;
+}
+
+static void send_json(int sock, const char* json){
+    char buf[2048];
+    snprintf(buf,sizeof(buf),"%s\n",json);
+    send(sock,buf,strlen(buf),0);
+}
+
+/* Минимальный JSON-поиск строкового значения ключа */
+static int json_str(const char* json, const char* key, char* out, int outlen){
+    char pat[128]; snprintf(pat,sizeof(pat),"\"%s\"",key);
+    const char* p = strstr(json,pat); if(!p) return 0;
+    p += strlen(pat);
+    while(*p==' '||*p==':') p++;
+    if(*p!='"') return 0; p++;
+    int i=0;
+    while(*p && *p!='"' && i<outlen-1) out[i++]=*p++;
+    out[i]=0; return 1;
+}
+
+static double json_num(const char* json, const char* key){
+    char pat[128]; snprintf(pat,sizeof(pat),"\"%s\"",key);
+    const char* p = strstr(json,pat); if(!p) return 0;
+    p += strlen(pat);
+    while(*p==' '||*p==':') p++;
+    return atof(p);
+}
+
+static char net_buf[65536];
+static int  net_pos=0;
+
+static char* read_line(int sock){
+    while(1){
+        char* nl = (char*)memchr(net_buf,'\n',net_pos);
+        if(nl){
+            *nl=0;
+            int len = (int)(nl - net_buf)+1;
+            memmove(net_buf, nl+1, net_pos - len);
+            net_pos -= len;
+            return net_buf; /* ОСТОРОЖНО: перезапишется при следующем вызове */
+        }
+        if(net_pos >= (int)sizeof(net_buf)-1) net_pos=0;
+        int n = recv(sock, net_buf+net_pos, sizeof(net_buf)-net_pos-1, 0);
+        if(n<=0) return NULL;
+        net_pos += n;
+    }
+}
+
+/* =========================================================
+ * GPU контекст
+ * ========================================================= */
+
+static int8_t*  d_Ap  = NULL;
+static int8_t*  d_BpT = NULL;
+static int*     d_found = NULL;
+static int*     d_out_i = NULL;
+static int*     d_out_j = NULL;
+static uint32_t* d_out_digest = NULL;
+
+static void gpu_init(){
+    size_t szAp  = (size_t)M_DIM * K_DIM;
+    size_t szBpT = (size_t)N_DIM * K_DIM;
+    cudaMalloc(&d_Ap,  szAp);
+    cudaMalloc(&d_BpT, szBpT);
+    cudaMalloc(&d_found,      sizeof(int));
+    cudaMalloc(&d_out_i,      sizeof(int));
+    cudaMalloc(&d_out_j,      sizeof(int));
+    cudaMalloc(&d_out_digest, 8*sizeof(uint32_t));
+}
+
+static int gpu_mine(const int8_t* h_Ap, const int8_t* h_BpT,
+                    const uint8_t* sA, double difficulty,
+                    int* found_i, int* found_j, char* digest_hex)
+{
+    size_t szAp  = (size_t)M_DIM * K_DIM;
+    size_t szBpT = (size_t)N_DIM * K_DIM;
+
+    cudaMemcpy(d_Ap,  h_Ap,  szAp,  cudaMemcpyHostToDevice);
+    cudaMemcpy(d_BpT, h_BpT, szBpT, cudaMemcpyHostToDevice);
+
+    int zero=0;
+    cudaMemcpy(d_found, &zero, sizeof(int), cudaMemcpyHostToDevice);
+
+    /* sA → 8 uint32 */
+    uint32_t sA32[8];
+    memcpy(sA32, sA, 32);
+
+    /* target = 2^(256-diff) * R * TM * TN  (256-bit LE) */
+    /* Вычисляем как double, потом конвертируем в uint256 */
+    /* target = 2^(256 - diff + log2(R*TM*TN)) */
+    double exp_val = 256.0 - difficulty + log2((double)(R_RANK * TM * TN));
+    /* Упаковываем target в 8 × uint32 LE */
+    uint32_t tgt[8]={0};
+    if(exp_val >= 256.0){
+        for(int i=0;i<8;i++) tgt[i]=0xFFFFFFFFu;
+    } else if(exp_val >= 0.0){
+        int word = (int)exp_val / 32;
+        int bit  = (int)exp_val % 32;
+        if(word < 8){
+            tgt[word] = (1u << bit);
+            /* заполняем выше нулём: уже нули */
+            /* но надо добавить дробную часть */
+        }
+        /* Приближение: просто ставим единицу в нужном разряде */
+    }
+
+    dim3 block(TN, TM);
+    dim3 grid(M_DIM/TM, N_DIM/TN);
+
+    mine_kernel<<<grid,block>>>(
+        d_Ap, d_BpT, M_DIM, N_DIM, K_DIM, R_RANK, sA32,
+        tgt[0],tgt[1],tgt[2],tgt[3],tgt[4],tgt[5],tgt[6],tgt[7],
+        d_out_i, d_out_j, d_out_digest, d_found
+    );
+    cudaDeviceSynchronize();
+
+    int found=0;
+    cudaMemcpy(&found, d_found, sizeof(int), cudaMemcpyDeviceToHost);
+    if(found){
+        cudaMemcpy(found_i,    d_out_i,      sizeof(int),          cudaMemcpyDeviceToHost);
+        cudaMemcpy(found_j,    d_out_j,      sizeof(int),          cudaMemcpyDeviceToHost);
+        uint32_t dg[8];
+        cudaMemcpy(dg, d_out_digest, 32, cudaMemcpyDeviceToHost);
+        /* hex */
+        uint8_t* b = (uint8_t*)dg;
+        for(int i=0;i<32;i++) sprintf(digest_hex+i*2,"%02x",b[i]);
+        digest_hex[64]=0;
+    }
+    return found;
+}
+
+/* =========================================================
+ * main
+ * ========================================================= */
+
+int main(int argc, char** argv){
+    const char* pool_host = "pearl.baikalmine.com";
+    int         pool_port = 2010;
+    const char* wallet    = NULL;
+    int         device_id = 0;
+
+    for(int i=1;i<argc;i++){
+        if(!strcmp(argv[i],"--pool") && i+1<argc){
+            /* "stratum+tcp://host:port" */
+            const char* u = argv[++i];
+            const char* h = strstr(u,"://");
+            if(h){ h+=3;
+                const char* colon = strchr(h,':');
+                if(colon){
+                    int hlen = (int)(colon-h);
+                    static char hbuf[256];
+                    strncpy(hbuf,h,hlen); hbuf[hlen]=0;
+                    pool_host=hbuf; pool_port=atoi(colon+1);
+                }
+            }
+        } else if(!strcmp(argv[i],"--wallet") && i+1<argc) wallet=argv[++i];
+        else if(!strcmp(argv[i],"--device") && i+1<argc) device_id=atoi(argv[++i]);
+        else if(!strcmp(argv[i],"--help")||!strcmp(argv[i],"-h")){
+            printf("Pearl NoisyGEMM miner (sm_75)\n");
+            printf("  --pool URI    stratum+tcp://host:port\n");
+            printf("  --wallet ADDR wallet.worker\n");
+            printf("  --device N    CUDA device (default 0)\n");
+            return 0;
+        }
+    }
+    if(!wallet){ fprintf(stderr,"--wallet required\n"); return 1; }
+
+    cudaSetDevice(device_id);
+    gpu_init();
+
+    printf("[main] Подключаемся к %s:%d...\n",pool_host,pool_port);
+    tcp_sock = tcp_connect(pool_host, pool_port);
+    if(tcp_sock<0) return 1;
+
+    /* Handshake */
+    char msg[512];
+    snprintf(msg,sizeof(msg),
+        "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"pearl-cu/1.0\"]}");
+    send_json(tcp_sock, msg);
+    snprintf(msg,sizeof(msg),
+        "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"%s\",\"x\"]}",wallet);
+    send_json(tcp_sock, msg);
+
+    int8_t* h_Ap  = (int8_t*)malloc((size_t)M_DIM * K_DIM);
+    int8_t* h_BpT = (int8_t*)malloc((size_t)N_DIM * K_DIM);
+    uint8_t sA[32];
+    char cur_seed[128]={0};
+    int msg_id = 3;
+
+    while(1){
+        char* line = read_line(tcp_sock);
+        if(!line){ printf("[net] Соединение потеряно\n"); break; }
+        printf("[net] %s\n", line); fflush(stdout);
+
+        if(strstr(line,"pearl.challenge")){
+            char seed[128]={0}; double diff=32.0;
+            json_str(line,"seed",seed,sizeof(seed));
+            diff = json_num(line,"difficulty");
+            if(!diff) diff=32.0;
+
+            if(!strcmp(seed,cur_seed)){ continue; } /* тот же challenge */
+            strncpy(cur_seed,seed,sizeof(cur_seed)-1);
+
+            printf("[job] seed=%s diff=%.1f\n",seed,diff);
+
+            /* Конвертируем hex → bytes */
+            int slen = strlen(seed)/2;
+            uint8_t* sigma = (uint8_t*)malloc(slen);
+            for(int i=0;i<slen;i++){
+                unsigned v; sscanf(seed+i*2,"%02x",&v); sigma[i]=(uint8_t)v;
+            }
+
+            printf("[gen] Генерируем матрицы...\n"); fflush(stdout);
+            generate_matrices(sigma, slen, h_Ap, h_BpT, sA);
+            free(sigma);
+
+            printf("[gpu] Запускаем ядро...\n"); fflush(stdout);
+            int fi=-1, fj=-1; char dg[65]={0};
+            int found = gpu_mine(h_Ap, h_BpT, sA, diff, &fi, &fj, dg);
+
+            if(found){
+                printf("[gpu] НАЙДЕНО тайл(%d,%d) digest=%s\n",fi,fj,dg);
+                char sub[512];
+                snprintf(sub,sizeof(sub),
+                    "{\"id\":%d,\"method\":\"pearl.submit\","
+                    "\"params\":{\"seed\":\"%s\",\"tile_i\":%d,\"tile_j\":%d,\"digest\":\"%s\"}}",
+                    msg_id++, cur_seed, fi, fj, dg);
+                send_json(tcp_sock, sub);
+            } else {
+                printf("[gpu] Тайл не найден в этом проходе\n");
+            }
+        }
+    }
+
+    free(h_Ap); free(h_BpT);
+    return 0;
+}
