@@ -473,16 +473,8 @@ static char* read_line(int sock){
 }
 
 /* =========================================================
- * GPU контекст
+ * GPU контекст — мульти-GPU
  * ========================================================= */
-
-static int8_t*   d_Ap     = NULL;
-static int8_t*   d_BpT    = NULL;
-static int*      d_found  = NULL;
-static int*      d_out_i  = NULL;
-static int*      d_out_j  = NULL;
-static uint32_t* d_out_digest = NULL;
-static uint32_t* d_sA32   = NULL; /* 8 × uint32 ключ sA в видеопамяти */
 
 #define CU_CHECK(call) do { \
     cudaError_t _e = (call); \
@@ -492,90 +484,109 @@ static uint32_t* d_sA32   = NULL; /* 8 × uint32 ключ sA в видеопам
     } \
 } while(0)
 
-static void gpu_init(){
+#define MAX_GPUS 16
+
+typedef struct {
+    int          dev;
+    int8_t*      d_Ap;
+    int8_t*      d_BpT;
+    int*         d_found;
+    int*         d_out_i;
+    int*         d_out_j;
+    uint32_t*    d_out_digest;
+    uint32_t*    d_sA32;
+} GpuCtx;
+
+static GpuCtx g_gpus[MAX_GPUS];
+static int    g_ngpu = 0;
+
+static void gpu_init_all(int* devs, int ndev){
     size_t szAp  = (size_t)M_DIM * K_DIM;
     size_t szBpT = (size_t)N_DIM * K_DIM;
-    printf("[gpu] cudaMalloc Ap=%.0fMB BpT=%.0fMB...\n",
-           (double)szAp/1e6, (double)szBpT/1e6);
+    g_ngpu = ndev;
+    printf("[gpu] Инициализируем %d GPU (Ap=%.0fMB BpT=%.0fMB каждая)...\n",
+           ndev, (double)szAp/1e6, (double)szBpT/1e6);
     fflush(stdout);
-    CU_CHECK(cudaMalloc(&d_Ap,         szAp));
-    CU_CHECK(cudaMalloc(&d_BpT,        szBpT));
-    CU_CHECK(cudaMalloc(&d_found,      sizeof(int)));
-    CU_CHECK(cudaMalloc(&d_out_i,      sizeof(int)));
-    CU_CHECK(cudaMalloc(&d_out_j,      sizeof(int)));
-    CU_CHECK(cudaMalloc(&d_out_digest, 8*sizeof(uint32_t)));
-    CU_CHECK(cudaMalloc(&d_sA32,       8*sizeof(uint32_t)));
-    printf("[gpu] cudaMalloc OK\n"); fflush(stdout);
+    for(int i = 0; i < ndev; i++){
+        GpuCtx* g = &g_gpus[i];
+        g->dev = devs[i];
+        CU_CHECK(cudaSetDevice(g->dev));
+        CU_CHECK(cudaMalloc(&g->d_Ap,         szAp));
+        CU_CHECK(cudaMalloc(&g->d_BpT,        szBpT));
+        CU_CHECK(cudaMalloc(&g->d_found,      sizeof(int)));
+        CU_CHECK(cudaMalloc(&g->d_out_i,      sizeof(int)));
+        CU_CHECK(cudaMalloc(&g->d_out_j,      sizeof(int)));
+        CU_CHECK(cudaMalloc(&g->d_out_digest, 8*sizeof(uint32_t)));
+        CU_CHECK(cudaMalloc(&g->d_sA32,       8*sizeof(uint32_t)));
+        printf("[gpu] GPU%d OK\n", g->dev); fflush(stdout);
+    }
 }
 
-static int gpu_mine(const int8_t* h_Ap, const int8_t* h_BpT,
-                    const uint8_t* sA, double difficulty,
-                    int* found_i, int* found_j, char* digest_hex)
+static int gpu_mine_all(const int8_t* h_Ap, const int8_t* h_BpT,
+                        const uint8_t* sA, double difficulty,
+                        int* found_i, int* found_j, char* digest_hex)
 {
     size_t szAp  = (size_t)M_DIM * K_DIM;
     size_t szBpT = (size_t)N_DIM * K_DIM;
 
-    printf("[gpu] Копируем Ap/BpT на GPU...\n"); fflush(stdout);
-    CU_CHECK(cudaMemcpy(d_Ap,  h_Ap,  szAp,  cudaMemcpyHostToDevice));
-    CU_CHECK(cudaMemcpy(d_BpT, h_BpT, szBpT, cudaMemcpyHostToDevice));
-    printf("[gpu] Копирование OK\n"); fflush(stdout);
-
-    int zero=0;
-    CU_CHECK(cudaMemcpy(d_found, &zero, sizeof(int), cudaMemcpyHostToDevice));
-
-    /* sA → 8 uint32, копируем в видеопамять */
     uint32_t sA32[8];
     memcpy(sA32, sA, 32);
-    CU_CHECK(cudaMemcpy(d_sA32, sA32, 32, cudaMemcpyHostToDevice));
 
-    /* target = 2^(256-diff) * R * TM * TN  (256-bit LE) */
-    /* Вычисляем как double, потом конвертируем в uint256 */
-    /* target = 2^(256 - diff + log2(R*TM*TN)) */
     double exp_val = 256.0 - difficulty + log2((double)(R_RANK * TM * TN));
-    /* Упаковываем target в 8 × uint32 LE */
     uint32_t tgt[8]={0};
     if(exp_val >= 256.0){
         for(int i=0;i<8;i++) tgt[i]=0xFFFFFFFFu;
     } else if(exp_val >= 0.0){
         int word = (int)exp_val / 32;
         int bit  = (int)exp_val % 32;
-        if(word < 8){
-            tgt[word] = (1u << bit);
-            /* заполняем выше нулём: уже нули */
-            /* но надо добавить дробную часть */
-        }
-        /* Приближение: просто ставим единицу в нужном разряде */
+        if(word < 8) tgt[word] = (1u << bit);
     }
+    printf("[gpu] target[7]=0x%08X, запускаем %d GPU...\n", tgt[7], g_ngpu);
+    fflush(stdout);
 
     dim3 block(TN, TM);
     dim3 grid(M_DIM/TM, N_DIM/TN);
+    int zero = 0;
 
-    printf("[gpu] grid=(%d,%d) block=(%d,%d) target[7]=0x%08X\n",
-           M_DIM/TM, N_DIM/TN, TN, TM, tgt[7]);
-    fflush(stdout);
-
-    mine_kernel<<<grid,block>>>(
-        d_Ap, d_BpT, M_DIM, N_DIM, K_DIM, R_RANK, d_sA32,
-        tgt[0],tgt[1],tgt[2],tgt[3],tgt[4],tgt[5],tgt[6],tgt[7],
-        d_out_i, d_out_j, d_out_digest, d_found
-    );
-    CU_CHECK(cudaGetLastError());
-    printf("[gpu] Ядро запущено, ждём синхронизации...\n"); fflush(stdout);
-    CU_CHECK(cudaDeviceSynchronize());
-    printf("[gpu] Синхронизация OK\n"); fflush(stdout);
-
-    int found=0;
-    CU_CHECK(cudaMemcpy(&found, d_found, sizeof(int), cudaMemcpyDeviceToHost));
-    if(found){
-        cudaMemcpy(found_i,    d_out_i,      sizeof(int),          cudaMemcpyDeviceToHost);
-        cudaMemcpy(found_j,    d_out_j,      sizeof(int),          cudaMemcpyDeviceToHost);
-        uint32_t dg[8];
-        cudaMemcpy(dg, d_out_digest, 32, cudaMemcpyDeviceToHost);
-        /* hex */
-        uint8_t* b = (uint8_t*)dg;
-        for(int i=0;i<32;i++) sprintf(digest_hex+i*2,"%02x",b[i]);
-        digest_hex[64]=0;
+    /* Копируем на каждую GPU и запускаем ядро.
+     * GPU N вычисляет пока мы копируем на GPU N+1. */
+    for(int i = 0; i < g_ngpu; i++){
+        GpuCtx* g = &g_gpus[i];
+        CU_CHECK(cudaSetDevice(g->dev));
+        CU_CHECK(cudaMemcpy(g->d_Ap,    h_Ap,  szAp,  cudaMemcpyHostToDevice));
+        CU_CHECK(cudaMemcpy(g->d_BpT,   h_BpT, szBpT, cudaMemcpyHostToDevice));
+        CU_CHECK(cudaMemcpy(g->d_found, &zero, sizeof(int), cudaMemcpyHostToDevice));
+        CU_CHECK(cudaMemcpy(g->d_sA32,  sA32,  32,    cudaMemcpyHostToDevice));
+        mine_kernel<<<grid,block>>>(
+            g->d_Ap, g->d_BpT, M_DIM, N_DIM, K_DIM, R_RANK, g->d_sA32,
+            tgt[0],tgt[1],tgt[2],tgt[3],tgt[4],tgt[5],tgt[6],tgt[7],
+            g->d_out_i, g->d_out_j, g->d_out_digest, g->d_found
+        );
+        CU_CHECK(cudaGetLastError());
+        printf("[gpu] GPU%d: ядро запущено\n", g->dev); fflush(stdout);
     }
+
+    /* Ждём все GPU, проверяем результаты */
+    int found = 0;
+    for(int i = 0; i < g_ngpu; i++){
+        GpuCtx* g = &g_gpus[i];
+        CU_CHECK(cudaSetDevice(g->dev));
+        CU_CHECK(cudaDeviceSynchronize());
+        int f = 0;
+        CU_CHECK(cudaMemcpy(&f, g->d_found, sizeof(int), cudaMemcpyDeviceToHost));
+        if(f && !found){
+            found = 1;
+            cudaMemcpy(found_i, g->d_out_i, sizeof(int), cudaMemcpyDeviceToHost);
+            cudaMemcpy(found_j, g->d_out_j, sizeof(int), cudaMemcpyDeviceToHost);
+            uint32_t dg[8];
+            cudaMemcpy(dg, g->d_out_digest, 32, cudaMemcpyDeviceToHost);
+            uint8_t* b = (uint8_t*)dg;
+            for(int k=0;k<32;k++) sprintf(digest_hex+k*2,"%02x",b[k]);
+            digest_hex[64]=0;
+            printf("[gpu] GPU%d: НАШЁЛ ШАРУ!\n", g->dev); fflush(stdout);
+        }
+    }
+    printf("[gpu] Все GPU завершили\n"); fflush(stdout);
     return found;
 }
 
@@ -587,11 +598,11 @@ int main(int argc, char** argv){
     const char* pool_host = "pearl.baikalmine.com";
     int         pool_port = 2010;
     const char* wallet    = NULL;
-    int         device_id = 0;
+    int         devs[MAX_GPUS] = {0};
+    int         ndev = 0;
 
     for(int i=1;i<argc;i++){
         if(!strcmp(argv[i],"--pool") && i+1<argc){
-            /* "stratum+tcp://host:port" */
             const char* u = argv[++i];
             const char* h = strstr(u,"://");
             if(h){ h+=3;
@@ -604,20 +615,25 @@ int main(int argc, char** argv){
                 }
             }
         } else if(!strcmp(argv[i],"--wallet") && i+1<argc) wallet=argv[++i];
-        else if(!strcmp(argv[i],"--device") && i+1<argc) device_id=atoi(argv[++i]);
+        else if((!strcmp(argv[i],"--device")||!strcmp(argv[i],"--devices")) && i+1<argc){
+            /* "0" или "0,1,2,3" */
+            const char* s = argv[++i];
+            char tmp[256]; strncpy(tmp,s,255); tmp[255]=0;
+            char* tok = strtok(tmp,",");
+            while(tok && ndev<MAX_GPUS){ devs[ndev++]=atoi(tok); tok=strtok(NULL,","); }
+        }
         else if(!strcmp(argv[i],"--help")||!strcmp(argv[i],"-h")){
-            printf("Pearl NoisyGEMM miner (sm_75)\n");
-            printf("  --pool URI    stratum+tcp://host:port\n");
-            printf("  --wallet ADDR wallet.worker\n");
-            printf("  --device N    CUDA device (default 0)\n");
+            printf("Pearl NoisyGEMM miner (sm_75/sm_86)\n");
+            printf("  --pool URI       stratum+tcp://host:port\n");
+            printf("  --wallet ADDR    wallet.worker\n");
+            printf("  --devices N[,M]  CUDA устройства (default: 0)\n");
             return 0;
         }
     }
     if(!wallet){ fprintf(stderr,"--wallet required\n"); return 1; }
+    if(!ndev){ devs[0]=0; ndev=1; }
 
-    printf("[main] cudaSetDevice(%d)...\n", device_id); fflush(stdout);
-    CU_CHECK(cudaSetDevice(device_id));
-    gpu_init();
+    gpu_init_all(devs, ndev);
 
     printf("[main] Подключаемся к %s:%d...\n",pool_host,pool_port);
     tcp_sock = tcp_connect(pool_host, pool_port);
@@ -665,9 +681,9 @@ int main(int argc, char** argv){
             generate_matrices(sigma, slen, diff, h_Ap, h_BpT, sA);
             free(sigma);
 
-            printf("[gpu] Запускаем ядро...\n"); fflush(stdout);
+            printf("[gpu] Запускаем ядра...\n"); fflush(stdout);
             int fi=-1, fj=-1; char dg[65]={0};
-            int found = gpu_mine(h_Ap, h_BpT, sA, diff, &fi, &fj, dg);
+            int found = gpu_mine_all(h_Ap, h_BpT, sA, diff, &fi, &fj, dg);
 
             if(found){
                 printf("[gpu] НАЙДЕНО тайл(%d,%d) digest=%s\n",fi,fj,dg);
