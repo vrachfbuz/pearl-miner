@@ -8,7 +8,7 @@ rm -rf "$SRCDIR"
 mkdir -p "$SRCDIR"
 cd "$SRCDIR"
 
-BASE="https://raw.githubusercontent.com/vrachfbuz/pearl-miner/main"
+BASE="https://raw.githubusercontent.com/vrachfbuz/pearl-miner/master"
 B3="https://raw.githubusercontent.com/BLAKE3-team/BLAKE3/1.5.4/c"
 
 echo "=== Скачиваем исходники майнера ==="
