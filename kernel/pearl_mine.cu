@@ -734,6 +734,7 @@ int main(int argc, char** argv){
     const char* wallet    = NULL;
     int         devs[MAX_GPUS] = {0};
     int         ndev = 0;
+    int         observe_only = 0;
 
     for(int i=1;i<argc;i++){
         if(!strcmp(argv[i],"--pool") && i+1<argc){
@@ -756,18 +757,27 @@ int main(int argc, char** argv){
             char* tok = strtok(tmp,",");
             while(tok && ndev<MAX_GPUS){ devs[ndev++]=atoi(tok); tok=strtok(NULL,","); }
         }
+        else if(!strcmp(argv[i],"--observe-only")){
+            observe_only = 1;
+        }
         else if(!strcmp(argv[i],"--help")||!strcmp(argv[i],"-h")){
             printf("Pearl NoisyGEMM miner (sm_75/sm_86)\n");
             printf("  --pool URI       stratum+tcp://host:port\n");
             printf("  --wallet ADDR    wallet.worker\n");
             printf("  --devices N[,M]  CUDA устройства (default: 0)\n");
+            printf("  --observe-only   только лог входящих сообщений, без submit\n");
             return 0;
         }
     }
     if(!wallet){ fprintf(stderr,"--wallet required\n"); return 1; }
     if(!ndev){ devs[0]=0; ndev=1; }
 
-    gpu_init_all(devs, ndev);
+    if(!observe_only){
+        gpu_init_all(devs, ndev);
+    } else {
+        printf("[mode] observe-only enabled: mining/submit disabled\n");
+        fflush(stdout);
+    }
 
     int8_t* h_Ap  = (int8_t*)malloc((size_t)M_DIM * K_DIM);
     int8_t* h_BpT = (int8_t*)malloc((size_t)N_DIM * K_DIM);
@@ -818,6 +828,8 @@ reconnect:
             goto reconnect;
         }
 
+        printf("[pool-raw] %s\n", line); fflush(stdout);
+
         if(strstr(line,"mining.notify")){
             extract_notify_job_id(line, g_last_job_id, sizeof(g_last_job_id));
             json_str(line, "incomplete_header_bytes", g_last_incomplete_header, sizeof(g_last_incomplete_header));
@@ -837,6 +849,11 @@ reconnect:
             strncpy(cur_seed,seed,sizeof(cur_seed)-1);
 
             printf("[job] seed=%s diff=%.1f\n",seed,diff); fflush(stdout);
+            if(observe_only){
+                printf("[mode] observe-only: skip mining for this job\n");
+                fflush(stdout);
+                continue;
+            }
 
             int slen = strlen(seed)/2;
             uint8_t* sigma = (uint8_t*)malloc(slen);
