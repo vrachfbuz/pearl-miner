@@ -429,7 +429,7 @@ static char g_seed[128]  = {0};
 static double g_diff      = 32.0;
 static volatile int g_new_job = 0;
 static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
-static int g_submit_mode = 0;      /* 0..4 fallback modes */
+static int g_submit_mode = 0;      /* 0..5 fallback modes */
 static int g_submit_inflight = 0;  /* ждём result/error после submit */
 static char g_last_share_id[256] = {0}; /* seed:tile_i:tile_j:digest */
 
@@ -514,11 +514,18 @@ static int send_submit_with_mode(
             "{\"id\":%d,\"method\":\"mining.submit\","
             "\"params\":[\"%s\",\"%s\",\"%s\",%d,%d]}",
             msg_id, worker_login, seed, digest, tile_i, tile_j);
-    } else {
+    } else if(mode == 4) {
         snprintf(sub,sizeof(sub),
             "{\"id\":%d,\"method\":\"pearl.challenge_response\","
             "\"params\":{\"seed\":\"%s\",\"nonce\":\"%s\"}}",
             msg_id, seed, digest);
+    } else {
+        snprintf(sub,sizeof(sub),
+            "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"submitPlainProof\","
+            "\"params\":{\"plain_proof\":\"%s\","
+            "\"target\":\"%s\","
+            "\"mining_job\":{\"seed\":\"%s\",\"tile_i\":%d,\"tile_j\":%d}}}",
+            msg_id, transcript, digest, seed, tile_i, tile_j);
     }
     printf("[net] submit mode=%d json=%s\n", mode, sub); fflush(stdout);
     return send_json(sock, sub);
@@ -754,7 +761,7 @@ int main(int argc, char** argv){
 reconnect:
     if(tcp_sock >= 0){ close(tcp_sock); tcp_sock=-1; }
     if(g_submit_inflight){
-        g_submit_mode = (g_submit_mode + 1) % 5;
+        g_submit_mode = (g_submit_mode + 1) % 6;
         g_submit_inflight = 0;
         printf("[net] submit оборван; переключаю mode на %d\n", g_submit_mode);
         fflush(stdout);
@@ -772,10 +779,16 @@ reconnect:
     {
         char msg[512];
         snprintf(msg,sizeof(msg),
-            "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"pearl-cu/1.0\"]}");
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"mining.configure\","
+            "\"params\":[[\"pearl/v1\"],{}]}");
         if(!send_json(tcp_sock, msg)) goto reconnect;
         snprintf(msg,sizeof(msg),
-            "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"%s\",\"x\"]}",wallet);
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"mining.subscribe\","
+            "\"params\":[\"pearl-cu/1.0\"]}");
+        if(!send_json(tcp_sock, msg)) goto reconnect;
+        snprintf(msg,sizeof(msg),
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"mining.authorize\","
+            "\"params\":[\"%s\",\"x\"]}",wallet);
         if(!send_json(tcp_sock, msg)) goto reconnect;
     }
 
