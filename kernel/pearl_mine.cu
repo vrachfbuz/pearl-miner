@@ -73,12 +73,13 @@ static void blake3_concat(const uint8_t* a, int alen,
  * Ref: pearl_noisygemm_reference.py / py-pearl-mining
  * ========================================================= */
 
-#define M_DIM  131072
-#define N_DIM  131072
+#define M_DIM  8192
+#define N_DIM  8192
 #define K_DIM  4096
 #define R_RANK 256
 #define TM     16
 #define TN     16
+#define Y_TILES_PER_BATCH 64
 
 /* int32 clamp */
 static inline int8_t clamp8(int32_t v) {
@@ -333,12 +334,13 @@ __global__ void mine_kernel(
     /* target: 8 uint32 LE (256-бит) */
     uint32_t t0,uint32_t t1,uint32_t t2,uint32_t t3,
     uint32_t t4,uint32_t t5,uint32_t t6,uint32_t t7,
+    int bj_tile_base,
     /* выход */
     int* out_i, int* out_j, uint32_t* out_digest8, uint32_t* out_transcript16,
     int* found_flag
 ){
     const int ti = (int)blockIdx.x * TM;
-    const int tj = (int)blockIdx.y * TN;
+    const int tj = ((int)blockIdx.y + bj_tile_base) * TN;
     if(ti+TM>M || tj+TN>N) return;
 
     const int row = threadIdx.y; /* 0..TM-1 */
@@ -561,55 +563,76 @@ static int gpu_mine_all(const int8_t* h_Ap, const int8_t* h_BpT,
             }
         }
     }
-    printf("[gpu] target[7]=0x%08X, запускаем %d GPU...\n", tgt[7], g_ngpu);
+    printf("[gpu] target LE words: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+           tgt[0],tgt[1],tgt[2],tgt[3],tgt[4],tgt[5],tgt[6],tgt[7]);
+    printf("[gpu] запускаем %d GPU...\n", g_ngpu);
     fflush(stdout);
 
     dim3 block(TN, TM);
-    dim3 grid(M_DIM/TM, N_DIM/TN);
+    const int x_tiles = M_DIM / TM;
+    const int y_tiles = N_DIM / TN;
+    const int y_batch = Y_TILES_PER_BATCH;
     int zero = 0;
 
-    /* Копируем на каждую GPU и запускаем ядро.
-     * GPU N вычисляет пока мы копируем на GPU N+1. */
+    /* Копируем вход на каждую GPU */
     for(int i = 0; i < g_ngpu; i++){
         GpuCtx* g = &g_gpus[i];
         CU_CHECK(cudaSetDevice(g->dev));
         CU_CHECK(cudaMemcpy(g->d_Ap,    h_Ap,  szAp,  cudaMemcpyHostToDevice));
         CU_CHECK(cudaMemcpy(g->d_BpT,   h_BpT, szBpT, cudaMemcpyHostToDevice));
-        CU_CHECK(cudaMemcpy(g->d_found, &zero, sizeof(int), cudaMemcpyHostToDevice));
         CU_CHECK(cudaMemcpy(g->d_sA32,  sA32,  32,    cudaMemcpyHostToDevice));
-        mine_kernel<<<grid,block>>>(
-            g->d_Ap, g->d_BpT, M_DIM, N_DIM, K_DIM, R_RANK, g->d_sA32,
-            tgt[0],tgt[1],tgt[2],tgt[3],tgt[4],tgt[5],tgt[6],tgt[7],
-            g->d_out_i, g->d_out_j, g->d_out_digest, g->d_out_transcript, g->d_found
-        );
-        CU_CHECK(cudaGetLastError());
-        printf("[gpu] GPU%d: ядро запущено\n", g->dev); fflush(stdout);
     }
 
-    /* Ждём все GPU, проверяем результаты */
-    int found = 0;
     for(int i = 0; i < g_ngpu; i++){
         GpuCtx* g = &g_gpus[i];
         CU_CHECK(cudaSetDevice(g->dev));
-        CU_CHECK(cudaDeviceSynchronize());
-        int f = 0;
-        CU_CHECK(cudaMemcpy(&f, g->d_found, sizeof(int), cudaMemcpyDeviceToHost));
-        if(f && !found){
-            found = 1;
-            cudaMemcpy(found_i, g->d_out_i, sizeof(int), cudaMemcpyDeviceToHost);
-            cudaMemcpy(found_j, g->d_out_j, sizeof(int), cudaMemcpyDeviceToHost);
-            uint32_t dg[8];
-            cudaMemcpy(dg, g->d_out_digest, 32, cudaMemcpyDeviceToHost);
-            uint8_t* b = (uint8_t*)dg;
-            for(int k=0;k<32;k++) sprintf(digest_hex+k*2,"%02x",b[k]);
-            digest_hex[64]=0;
-            uint32_t tr[16];
-            cudaMemcpy(tr, g->d_out_transcript, 64, cudaMemcpyDeviceToHost);
-            uint8_t* tb = (uint8_t*)tr;
-            for(int k=0;k<64;k++) sprintf(transcript_hex+k*2,"%02x",tb[k]);
-            transcript_hex[128]=0;
-            printf("[gpu] GPU%d: НАШЁЛ ШАРУ!\n", g->dev); fflush(stdout);
+        CU_CHECK(cudaMemcpy(g->d_found, &zero, sizeof(int), cudaMemcpyHostToDevice));
+    }
+
+    /* Батчевый запуск по оси Y для более быстрой реакции и ранней остановки */
+    int found = 0;
+    for(int y0 = 0; y0 < y_tiles && !found; y0 += y_batch){
+        int gy = y_batch;
+        if(y0 + gy > y_tiles) gy = y_tiles - y0;
+        dim3 grid(x_tiles, gy);
+
+        for(int i = 0; i < g_ngpu; i++){
+            GpuCtx* g = &g_gpus[i];
+            CU_CHECK(cudaSetDevice(g->dev));
+            mine_kernel<<<grid,block>>>(
+                g->d_Ap, g->d_BpT, M_DIM, N_DIM, K_DIM, R_RANK, g->d_sA32,
+                tgt[0],tgt[1],tgt[2],tgt[3],tgt[4],tgt[5],tgt[6],tgt[7],
+                y0,
+                g->d_out_i, g->d_out_j, g->d_out_digest, g->d_out_transcript, g->d_found
+            );
+            CU_CHECK(cudaGetLastError());
         }
+
+        for(int i = 0; i < g_ngpu; i++){
+            GpuCtx* g = &g_gpus[i];
+            CU_CHECK(cudaSetDevice(g->dev));
+            CU_CHECK(cudaDeviceSynchronize());
+            int f = 0;
+            CU_CHECK(cudaMemcpy(&f, g->d_found, sizeof(int), cudaMemcpyDeviceToHost));
+            if(f && !found){
+                found = 1;
+                cudaMemcpy(found_i, g->d_out_i, sizeof(int), cudaMemcpyDeviceToHost);
+                cudaMemcpy(found_j, g->d_out_j, sizeof(int), cudaMemcpyDeviceToHost);
+                uint32_t dg[8];
+                cudaMemcpy(dg, g->d_out_digest, 32, cudaMemcpyDeviceToHost);
+                uint8_t* b = (uint8_t*)dg;
+                for(int k=0;k<32;k++) sprintf(digest_hex+k*2,"%02x",b[k]);
+                digest_hex[64]=0;
+                uint32_t tr[16];
+                cudaMemcpy(tr, g->d_out_transcript, 64, cudaMemcpyDeviceToHost);
+                uint8_t* tb = (uint8_t*)tr;
+                for(int k=0;k<64;k++) sprintf(transcript_hex+k*2,"%02x",tb[k]);
+                transcript_hex[128]=0;
+                printf("[gpu] GPU%d: НАШЁЛ ШАРУ!\n", g->dev); fflush(stdout);
+            }
+        }
+        printf("[gpu] прогресс: y-tiles %d/%d\n", y0 + gy, y_tiles);
+        fflush(stdout);
     }
     printf("[gpu] Все GPU завершили\n"); fflush(stdout);
     return found;
