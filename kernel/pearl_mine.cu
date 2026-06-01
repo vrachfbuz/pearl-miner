@@ -683,32 +683,42 @@ int main(int argc, char** argv){
 
     gpu_init_all(devs, ndev);
 
-    printf("[main] Подключаемся к %s:%d...\n",pool_host,pool_port);
-    tcp_sock = tcp_connect(pool_host, pool_port);
-    if(tcp_sock<0) return 1;
-
-    /* Handshake */
-    char msg[512];
-    snprintf(msg,sizeof(msg),
-        "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"pearl-cu/1.0\"]}");
-    send_json(tcp_sock, msg);
-    snprintf(msg,sizeof(msg),
-        "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"%s\",\"x\"]}",wallet);
-    send_json(tcp_sock, msg);
-
     int8_t* h_Ap  = (int8_t*)malloc((size_t)M_DIM * K_DIM);
     int8_t* h_BpT = (int8_t*)malloc((size_t)N_DIM * K_DIM);
-    uint8_t sA[32];
-    uint8_t sB[32];
-    uint8_t HA[32];
-    uint8_t HB[32];
+    if(!h_Ap || !h_BpT){ fprintf(stderr,"OOM host matrices\n"); return 1; }
+
+    uint8_t sA[32], sB[32], HA[32], HB[32];
     char cur_seed[128]={0};
     int msg_id = 3;
 
+reconnect:
+    if(tcp_sock >= 0){ close(tcp_sock); tcp_sock=-1; }
+    net_pos = 0;
+    printf("[main] Подключаемся к %s:%d...\n",pool_host,pool_port);
+    while(1){
+        tcp_sock = tcp_connect(pool_host, pool_port);
+        if(tcp_sock >= 0) break;
+        printf("[main] Переподключение через 5 сек...\n"); fflush(stdout);
+        sleep(5);
+    }
+
+    /* Handshake */
+    {
+        char msg[512];
+        snprintf(msg,sizeof(msg),
+            "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"pearl-cu/1.0\"]}");
+        send_json(tcp_sock, msg);
+        snprintf(msg,sizeof(msg),
+            "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"%s\",\"x\"]}",wallet);
+        send_json(tcp_sock, msg);
+    }
+
     while(1){
         char* line = read_line(tcp_sock);
-        if(!line){ printf("[net] Соединение потеряно\n"); break; }
-        printf("[net] %s\n", line); fflush(stdout);
+        if(!line){
+            printf("[net] Соединение потеряно, переподключаемся...\n"); fflush(stdout);
+            goto reconnect;
+        }
 
         if(strstr(line,"pearl.challenge")){
             char seed[128]={0}; double diff=32.0;
@@ -716,12 +726,11 @@ int main(int argc, char** argv){
             diff = json_num(line,"difficulty");
             if(!diff) diff=32.0;
 
-            if(!strcmp(seed,cur_seed)){ continue; } /* тот же challenge */
+            if(!strcmp(seed,cur_seed)){ continue; }
             strncpy(cur_seed,seed,sizeof(cur_seed)-1);
 
-            printf("[job] seed=%s diff=%.1f\n",seed,diff);
+            printf("[job] seed=%s diff=%.1f\n",seed,diff); fflush(stdout);
 
-            /* Конвертируем hex → bytes */
             int slen = strlen(seed)/2;
             uint8_t* sigma = (uint8_t*)malloc(slen);
             for(int i=0;i<slen;i++){
@@ -742,18 +751,22 @@ int main(int argc, char** argv){
                 bin_to_hex(sB, 32, sB_hex);
                 bin_to_hex(HA, 32, HA_hex);
                 bin_to_hex(HB, 32, HB_hex);
-                printf("[gpu] НАЙДЕНО тайл(%d,%d) digest=%s\n",fi,fj,dg);
+                printf("[gpu] НАЙДЕНО тайл(%d,%d) digest=%s\n",fi,fj,dg); fflush(stdout);
                 char sub[2048];
                 snprintf(sub,sizeof(sub),
                     "{\"id\":%d,\"method\":\"pearl.submit\","
                     "\"params\":{\"seed\":\"%s\",\"tile_i\":%d,\"tile_j\":%d,"
                     "\"sA\":\"%s\",\"sB\":\"%s\",\"HA\":\"%s\",\"HB\":\"%s\","
                     "\"transcript\":\"%s\",\"digest\":\"%s\"}}",
-                    msg_id++, cur_seed, fi, fj, sA_hex, sB_hex, HA_hex, HB_hex, transcript, dg);
+                    msg_id++, cur_seed, fi, fj,
+                    sA_hex, sB_hex, HA_hex, HB_hex, transcript, dg);
                 send_json(tcp_sock, sub);
+                printf("[net] submit отправлен, ждём ответ пула...\n"); fflush(stdout);
             } else {
-                printf("[gpu] Тайл не найден в этом проходе\n");
+                printf("[gpu] Тайл не найден\n"); fflush(stdout);
             }
+        } else if(strstr(line,"result") || strstr(line,"error")){
+            printf("[pool] %s\n", line); fflush(stdout);
         }
     }
 
