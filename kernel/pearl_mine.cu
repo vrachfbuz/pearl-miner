@@ -434,6 +434,8 @@ static int g_submit_mode = 3;      /* fixed: jsonrpc mining.submit */
 static int g_submit_inflight = 0;  /* ждём result/error после submit */
 static char g_last_share_id[256] = {0}; /* seed:tile_i:tile_j:digest */
 static char g_last_job_id[256] = {0};
+static int g_emit_proof_debug = 0;
+static char g_proof_debug_path[512] = "/tmp/pearl_proof_debug.log";
 
 static int tcp_connect(const char* host, int port){
     struct hostent* he = gethostbyname(host);
@@ -566,6 +568,15 @@ static int send_submit_with_mode(
     if(!build_proof_blob_b64(seed, tile_i, tile_j, digest, transcript, proof_b64, sizeof(proof_b64))){
         printf("[net] proof blob build failed\n"); fflush(stdout);
         return 0;
+    }
+    if(g_emit_proof_debug){
+        FILE* fp = fopen(g_proof_debug_path, "a");
+        if(fp){
+            fprintf(fp,
+                "seed=%s job_id=%s tile_i=%d tile_j=%d digest=%s transcript=%s proof_b64=%s\n",
+                seed, jid, tile_i, tile_j, digest, transcript, proof_b64);
+            fclose(fp);
+        }
     }
     snprintf(sub,sizeof(sub),
         "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"mining.submit\","
@@ -785,12 +796,21 @@ int main(int argc, char** argv){
         else if(!strcmp(argv[i],"--observe-only")){
             observe_only = 1;
         }
+        else if(!strcmp(argv[i],"--emit-proof-debug")){
+            g_emit_proof_debug = 1;
+        }
+        else if(!strcmp(argv[i],"--proof-debug-path") && i+1<argc){
+            strncpy(g_proof_debug_path, argv[++i], sizeof(g_proof_debug_path)-1);
+            g_proof_debug_path[sizeof(g_proof_debug_path)-1] = 0;
+        }
         else if(!strcmp(argv[i],"--help")||!strcmp(argv[i],"-h")){
             printf("Pearl NoisyGEMM miner (sm_75/sm_86)\n");
             printf("  --pool URI       stratum+tcp://host:port\n");
             printf("  --wallet ADDR    wallet.worker\n");
             printf("  --devices N[,M]  CUDA устройства (default: 0)\n");
             printf("  --observe-only   только лог входящих сообщений, без submit\n");
+            printf("  --emit-proof-debug  писать proof поля в файл\n");
+            printf("  --proof-debug-path  путь файла debug (default: /tmp/pearl_proof_debug.log)\n");
             return 0;
         }
     }
