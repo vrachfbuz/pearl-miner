@@ -212,6 +212,8 @@ class PearlStratumClient:
         self._buf = b""
         self._id = 1
         self._running = False
+        self._job_token = 0
+        self._job_lock = threading.Lock()
 
     def start(self):
         self._running = True
@@ -302,10 +304,13 @@ class PearlStratumClient:
             diff = params.get("difficulty", 32)
             log.info("JOB seed=%s... diff=%d", seed[:12], diff)
             if self.on_challenge:
+                with self._job_lock:
+                    self._job_token += 1
+                    token = self._job_token
                 # Запускаем в отдельном потоке чтобы не блокировать stratum
                 t = threading.Thread(
                     target=self.on_challenge,
-                    args=(seed, diff, self),
+                    args=(seed, diff, self, token),
                     daemon=True
                 )
                 t.start()
@@ -328,7 +333,7 @@ class PearlStratumClient:
 # Главный цикл майнинга
 # ---------------------------------------------------------------------------
 
-def on_challenge(seed: str, difficulty: int, client: PearlStratumClient):
+def on_challenge(seed: str, difficulty: int, client: PearlStratumClient, token: int):
     cfg = MiningConfig()
     cfg.b = float(difficulty)
 
@@ -348,6 +353,10 @@ def on_challenge(seed: str, difficulty: int, client: PearlStratumClient):
              elapsed, n_tiles, len(results))
 
     for r in results:
+        with client._job_lock:
+            if token != client._job_token:
+                log.info("job устарел, отправка остановлена")
+                return
         log.info("ОТКРЫТИЕ тайл(%d,%d) digest=%s...",
                  r["tile_i"], r["tile_j"], r["digest_hex"][:16])
         client.submit(seed, r["tile_i"], r["tile_j"], r)

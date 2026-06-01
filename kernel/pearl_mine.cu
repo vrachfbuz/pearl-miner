@@ -102,7 +102,10 @@ static inline uint32_t rotl32(uint32_t x, int s) {
 static void generate_matrices(const uint8_t* sigma, int sigma_len,
                                double difficulty,
                                int8_t* Ap, int8_t* BpT,
-                               uint8_t* sA_out)
+                               uint8_t* sA_out,
+                               uint8_t* sB_out,
+                               uint8_t* HA_out,
+                               uint8_t* HB_out)
 {
     const int m = M_DIM, n = N_DIM, k = K_DIM, r = R_RANK;
 
@@ -143,13 +146,11 @@ static void generate_matrices(const uint8_t* sigma, int sigma_len,
     uint8_t kappa[32];
     blake3_concat(sigma, sigma_len, mu_bytes, 64, kappa);
 
-    uint8_t HA[32], HB[32];
-    blake3_keyed_hash(kappa, (const uint8_t*)A, (size_t)m*k, HA);
-    blake3_keyed_hash(kappa, (const uint8_t*)B, (size_t)n*k, HB);
+    blake3_keyed_hash(kappa, (const uint8_t*)A, (size_t)m*k, HA_out);
+    blake3_keyed_hash(kappa, (const uint8_t*)B, (size_t)n*k, HB_out);
 
-    uint8_t sB[32];
-    blake3_concat(kappa, 32, HB, 32, sB);
-    blake3_concat(sB, 32, HA, 32, sA_out);
+    blake3_concat(kappa, 32, HB_out, 32, sB_out);
+    blake3_concat(sB_out, 32, HA_out, 32, sA_out);
     printf("[gen] kappa/sA/sB OK\n"); fflush(stdout);
 
     /* EL[m×r]: uniform [-32,31], keyed by sA */
@@ -188,7 +189,7 @@ static void generate_matrices(const uint8_t* sigma, int sigma_len,
     {
         uint8_t* raw = (uint8_t*)malloc((size_t)r * 8);
         if (!raw) { fprintf(stderr,"OOM FL raw\n"); exit(1); }
-        blake3_xof((const uint8_t*)"ER", 2, sB, 32, raw, (size_t)r*8);
+        blake3_xof((const uint8_t*)"FL", 2, sB_out, 32, raw, (size_t)r*8);
         for (int c = 0; c < r; c++) {
             int a = raw[c*8] % k;
             int d2 = raw[c*8+1] % k;
@@ -205,7 +206,7 @@ static void generate_matrices(const uint8_t* sigma, int sigma_len,
     {
         uint8_t* raw = (uint8_t*)malloc((size_t)r * n);
         if (!raw) { fprintf(stderr,"OOM FR raw\n"); exit(1); }
-        blake3_xof((const uint8_t*)"EL", 2, sB, 32, raw, (size_t)r*n);
+        blake3_xof((const uint8_t*)"FR", 2, sB_out, 32, raw, (size_t)r*n);
         /* Транспонируем: FRT[j*r + rr] = FR_orig[rr*n + j] */
         for (int rr = 0; rr < r; rr++) {
             const uint8_t* src = raw + (size_t)rr * n;
@@ -333,7 +334,7 @@ __global__ void mine_kernel(
     uint32_t t0,uint32_t t1,uint32_t t2,uint32_t t3,
     uint32_t t4,uint32_t t5,uint32_t t6,uint32_t t7,
     /* выход */
-    int* out_i, int* out_j, uint32_t* out_digest8,
+    int* out_i, int* out_j, uint32_t* out_digest8, uint32_t* out_transcript16,
     int* found_flag
 ){
     const int ti = (int)blockIdx.x * TM;
@@ -399,6 +400,7 @@ __global__ void mine_kernel(
                 *out_i = ti;
                 *out_j = tj;
                 for(int w=0;w<8;w++) out_digest8[w]=digest[w];
+                for(int w=0;w<16;w++) out_transcript16[w]=sM[w];
             }
         }
     }
@@ -455,6 +457,11 @@ static double json_num(const char* json, const char* key){
 static char net_buf[65536];
 static int  net_pos=0;
 
+static void bin_to_hex(const uint8_t* in, size_t n, char* out){
+    for(size_t i = 0; i < n; i++) sprintf(out + i*2, "%02x", in[i]);
+    out[n*2] = 0;
+}
+
 static char* read_line(int sock){
     while(1){
         char* nl = (char*)memchr(net_buf,'\n',net_pos);
@@ -494,6 +501,7 @@ typedef struct {
     int*         d_out_i;
     int*         d_out_j;
     uint32_t*    d_out_digest;
+    uint32_t*    d_out_transcript;
     uint32_t*    d_sA32;
 } GpuCtx;
 
@@ -517,6 +525,7 @@ static void gpu_init_all(int* devs, int ndev){
         CU_CHECK(cudaMalloc(&g->d_out_i,      sizeof(int)));
         CU_CHECK(cudaMalloc(&g->d_out_j,      sizeof(int)));
         CU_CHECK(cudaMalloc(&g->d_out_digest, 8*sizeof(uint32_t)));
+        CU_CHECK(cudaMalloc(&g->d_out_transcript, 16*sizeof(uint32_t)));
         CU_CHECK(cudaMalloc(&g->d_sA32,       8*sizeof(uint32_t)));
         printf("[gpu] GPU%d OK\n", g->dev); fflush(stdout);
     }
@@ -524,7 +533,7 @@ static void gpu_init_all(int* devs, int ndev){
 
 static int gpu_mine_all(const int8_t* h_Ap, const int8_t* h_BpT,
                         const uint8_t* sA, double difficulty,
-                        int* found_i, int* found_j, char* digest_hex)
+                        int* found_i, int* found_j, char* digest_hex, char* transcript_hex)
 {
     size_t szAp  = (size_t)M_DIM * K_DIM;
     size_t szBpT = (size_t)N_DIM * K_DIM;
@@ -532,14 +541,25 @@ static int gpu_mine_all(const int8_t* h_Ap, const int8_t* h_BpT,
     uint32_t sA32[8];
     memcpy(sA32, sA, 32);
 
-    double exp_val = 256.0 - difficulty + log2((double)(R_RANK * TM * TN));
+    long double exp_val = 256.0L - (long double)difficulty + log2l((long double)(R_RANK * TM * TN));
     uint32_t tgt[8]={0};
-    if(exp_val >= 256.0){
+    if(exp_val >= 256.0L){
         for(int i=0;i<8;i++) tgt[i]=0xFFFFFFFFu;
-    } else if(exp_val >= 0.0){
-        int word = (int)exp_val / 32;
-        int bit  = (int)exp_val % 32;
-        if(word < 8) tgt[word] = (1u << bit);
+    } else if(exp_val > 0.0L){
+        long double v = powl(2.0L, exp_val);
+        if(!isfinite((double)v)){
+            for(int i=0;i<8;i++) tgt[i]=0xFFFFFFFFu;
+        } else {
+            long double base = 4294967296.0L; /* 2^32 */
+            for(int i=0;i<8;i++){
+                long double rem = fmodl(v, base);
+                if(rem < 0.0L) rem = 0.0L;
+                if(rem > 4294967295.0L) rem = 4294967295.0L;
+                tgt[i] = (uint32_t)rem;
+                v = floorl(v / base);
+                if(v <= 0.0L) break;
+            }
+        }
     }
     printf("[gpu] target[7]=0x%08X, запускаем %d GPU...\n", tgt[7], g_ngpu);
     fflush(stdout);
@@ -560,7 +580,7 @@ static int gpu_mine_all(const int8_t* h_Ap, const int8_t* h_BpT,
         mine_kernel<<<grid,block>>>(
             g->d_Ap, g->d_BpT, M_DIM, N_DIM, K_DIM, R_RANK, g->d_sA32,
             tgt[0],tgt[1],tgt[2],tgt[3],tgt[4],tgt[5],tgt[6],tgt[7],
-            g->d_out_i, g->d_out_j, g->d_out_digest, g->d_found
+            g->d_out_i, g->d_out_j, g->d_out_digest, g->d_out_transcript, g->d_found
         );
         CU_CHECK(cudaGetLastError());
         printf("[gpu] GPU%d: ядро запущено\n", g->dev); fflush(stdout);
@@ -583,6 +603,11 @@ static int gpu_mine_all(const int8_t* h_Ap, const int8_t* h_BpT,
             uint8_t* b = (uint8_t*)dg;
             for(int k=0;k<32;k++) sprintf(digest_hex+k*2,"%02x",b[k]);
             digest_hex[64]=0;
+            uint32_t tr[16];
+            cudaMemcpy(tr, g->d_out_transcript, 64, cudaMemcpyDeviceToHost);
+            uint8_t* tb = (uint8_t*)tr;
+            for(int k=0;k<64;k++) sprintf(transcript_hex+k*2,"%02x",tb[k]);
+            transcript_hex[128]=0;
             printf("[gpu] GPU%d: НАШЁЛ ШАРУ!\n", g->dev); fflush(stdout);
         }
     }
@@ -651,6 +676,9 @@ int main(int argc, char** argv){
     int8_t* h_Ap  = (int8_t*)malloc((size_t)M_DIM * K_DIM);
     int8_t* h_BpT = (int8_t*)malloc((size_t)N_DIM * K_DIM);
     uint8_t sA[32];
+    uint8_t sB[32];
+    uint8_t HA[32];
+    uint8_t HB[32];
     char cur_seed[128]={0};
     int msg_id = 3;
 
@@ -678,20 +706,27 @@ int main(int argc, char** argv){
             }
 
             printf("[gen] Генерируем матрицы (diff=%.1f)...\n", diff); fflush(stdout);
-            generate_matrices(sigma, slen, diff, h_Ap, h_BpT, sA);
+            generate_matrices(sigma, slen, diff, h_Ap, h_BpT, sA, sB, HA, HB);
             free(sigma);
 
             printf("[gpu] Запускаем ядра...\n"); fflush(stdout);
-            int fi=-1, fj=-1; char dg[65]={0};
-            int found = gpu_mine_all(h_Ap, h_BpT, sA, diff, &fi, &fj, dg);
+            int fi=-1, fj=-1; char dg[65]={0}; char transcript[129]={0};
+            int found = gpu_mine_all(h_Ap, h_BpT, sA, diff, &fi, &fj, dg, transcript);
 
             if(found){
+                char sA_hex[65], sB_hex[65], HA_hex[65], HB_hex[65];
+                bin_to_hex(sA, 32, sA_hex);
+                bin_to_hex(sB, 32, sB_hex);
+                bin_to_hex(HA, 32, HA_hex);
+                bin_to_hex(HB, 32, HB_hex);
                 printf("[gpu] НАЙДЕНО тайл(%d,%d) digest=%s\n",fi,fj,dg);
-                char sub[512];
+                char sub[2048];
                 snprintf(sub,sizeof(sub),
                     "{\"id\":%d,\"method\":\"pearl.submit\","
-                    "\"params\":{\"seed\":\"%s\",\"tile_i\":%d,\"tile_j\":%d,\"digest\":\"%s\"}}",
-                    msg_id++, cur_seed, fi, fj, dg);
+                    "\"params\":{\"seed\":\"%s\",\"tile_i\":%d,\"tile_j\":%d,"
+                    "\"sA\":\"%s\",\"sB\":\"%s\",\"HA\":\"%s\",\"HB\":\"%s\","
+                    "\"transcript\":\"%s\",\"digest\":\"%s\"}}",
+                    msg_id++, cur_seed, fi, fj, sA_hex, sB_hex, HA_hex, HB_hex, transcript, dg);
                 send_json(tcp_sock, sub);
             } else {
                 printf("[gpu] Тайл не найден в этом проходе\n");
