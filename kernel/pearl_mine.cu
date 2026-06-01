@@ -432,6 +432,8 @@ static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
 static int g_submit_mode = 0;      /* 0..5 fallback modes */
 static int g_submit_inflight = 0;  /* ждём result/error после submit */
 static char g_last_share_id[256] = {0}; /* seed:tile_i:tile_j:digest */
+static char g_last_job_id[256] = {0};
+static char g_last_incomplete_header[2048] = {0};
 
 static int tcp_connect(const char* host, int port){
     struct hostent* he = gethostbyname(host);
@@ -468,6 +470,21 @@ static int json_str(const char* json, const char* key, char* out, int outlen){
     out[i]=0; return 1;
 }
 
+static int extract_notify_job_id(const char* json, char* out, int outlen){
+    const char* p = strstr(json, "\"params\":[");
+    if(!p) return 0;
+    p = strchr(p, '[');
+    if(!p) return 0;
+    p++;
+    while(*p==' ' || *p=='\t') p++;
+    if(*p!='"') return 0;
+    p++;
+    int i=0;
+    while(*p && *p!='"' && i<outlen-1) out[i++]=*p++;
+    out[i]=0;
+    return i>0;
+}
+
 static double json_num(const char* json, const char* key){
     char pat[128]; snprintf(pat,sizeof(pat),"\"%s\"",key);
     const char* p = strstr(json,pat); if(!p) return 0;
@@ -486,7 +503,7 @@ static void bin_to_hex(const uint8_t* in, size_t n, char* out){
 
 static int send_submit_with_mode(
     int sock, int msg_id, int mode,
-    const char* worker_login,
+    const char* worker_login, const char* job_id, const char* incomplete_header_bytes,
     const char* seed, int tile_i, int tile_j, const char* digest,
     const char* sA_hex, const char* sB_hex, const char* HA_hex,
     const char* HB_hex, const char* transcript
@@ -512,8 +529,8 @@ static int send_submit_with_mode(
     } else if(mode == 3) {
         snprintf(sub,sizeof(sub),
             "{\"id\":%d,\"method\":\"mining.submit\","
-            "\"params\":[\"%s\",\"%s\",\"%s\",%d,%d]}",
-            msg_id, worker_login, seed, digest, tile_i, tile_j);
+            "\"params\":[\"%s\",\"%s\",\"%s\"]}",
+            msg_id, worker_login, (job_id && job_id[0]) ? job_id : seed, digest);
     } else if(mode == 4) {
         snprintf(sub,sizeof(sub),
             "{\"id\":%d,\"method\":\"pearl.challenge_response\","
@@ -524,8 +541,10 @@ static int send_submit_with_mode(
             "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"submitPlainProof\","
             "\"params\":{\"plain_proof\":\"%s\","
             "\"target\":\"%s\","
-            "\"mining_job\":{\"seed\":\"%s\",\"tile_i\":%d,\"tile_j\":%d}}}",
-            msg_id, transcript, digest, seed, tile_i, tile_j);
+            "\"mining_job\":{\"seed\":\"%s\",\"tile_i\":%d,\"tile_j\":%d,"
+            "\"incomplete_header_bytes\":\"%s\"}}}",
+            msg_id, transcript, digest, seed, tile_i, tile_j,
+            (incomplete_header_bytes && incomplete_header_bytes[0]) ? incomplete_header_bytes : "");
     }
     printf("[net] submit mode=%d json=%s\n", mode, sub); fflush(stdout);
     return send_json(sock, sub);
@@ -800,7 +819,11 @@ reconnect:
         }
 
         if(strstr(line,"mining.notify")){
+            extract_notify_job_id(line, g_last_job_id, sizeof(g_last_job_id));
+            json_str(line, "incomplete_header_bytes", g_last_incomplete_header, sizeof(g_last_incomplete_header));
             printf("[pool] mining.notify raw=%s\n", line); fflush(stdout);
+            if(g_last_job_id[0]){ printf("[pool] mining.notify job_id=%s\n", g_last_job_id); fflush(stdout); }
+            if(g_last_incomplete_header[0]){ printf("[pool] incomplete_header_bytes len=%zu\n", strlen(g_last_incomplete_header)); fflush(stdout); }
             continue;
         }
 
@@ -845,7 +868,7 @@ reconnect:
                 strncpy(g_last_share_id, share_id, sizeof(g_last_share_id)-1);
                 g_last_share_id[sizeof(g_last_share_id)-1] = 0;
                 if(!send_submit_with_mode(
-                    tcp_sock, msg_id++, g_submit_mode, wallet, cur_seed, fi, fj, dg,
+                    tcp_sock, msg_id++, g_submit_mode, wallet, g_last_job_id, g_last_incomplete_header, cur_seed, fi, fj, dg,
                     sA_hex, sB_hex, HA_hex, HB_hex, transcript
                 )){
                     printf("[net] send submit failed\n"); fflush(stdout);
