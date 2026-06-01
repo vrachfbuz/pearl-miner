@@ -73,8 +73,8 @@ static void blake3_concat(const uint8_t* a, int alen,
  * Ref: pearl_noisygemm_reference.py / py-pearl-mining
  * ========================================================= */
 
-#define M_DIM  131072
-#define N_DIM  131072
+#define M_DIM  8192
+#define N_DIM  8192
 #define K_DIM  4096
 #define R_RANK 256
 #define TM     16
@@ -429,7 +429,7 @@ static char g_seed[128]  = {0};
 static double g_diff      = 32.0;
 static volatile int g_new_job = 0;
 static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
-static int g_submit_mode = 0;      /* 0=obj-full, 1=obj-min, 2=array-min */
+static int g_submit_mode = 0;      /* 0..4 fallback modes */
 static int g_submit_inflight = 0;  /* ждём result/error после submit */
 static char g_last_share_id[256] = {0}; /* seed:tile_i:tile_j:digest */
 
@@ -486,6 +486,7 @@ static void bin_to_hex(const uint8_t* in, size_t n, char* out){
 
 static int send_submit_with_mode(
     int sock, int msg_id, int mode,
+    const char* worker_login,
     const char* seed, int tile_i, int tile_j, const char* digest,
     const char* sA_hex, const char* sB_hex, const char* HA_hex,
     const char* HB_hex, const char* transcript
@@ -503,11 +504,21 @@ static int send_submit_with_mode(
             "{\"id\":%d,\"method\":\"pearl.submit\","
             "\"params\":{\"seed\":\"%s\",\"tile_i\":%d,\"tile_j\":%d,\"digest\":\"%s\"}}",
             msg_id, seed, tile_i, tile_j, digest);
-    } else {
+    } else if(mode == 2) {
         snprintf(sub,sizeof(sub),
             "{\"id\":%d,\"method\":\"pearl.submit\","
             "\"params\":[\"%s\",%d,%d,\"%s\"]}",
             msg_id, seed, tile_i, tile_j, digest);
+    } else if(mode == 3) {
+        snprintf(sub,sizeof(sub),
+            "{\"id\":%d,\"method\":\"mining.submit\","
+            "\"params\":[\"%s\",\"%s\",\"%s\",%d,%d]}",
+            msg_id, worker_login, seed, digest, tile_i, tile_j);
+    } else {
+        snprintf(sub,sizeof(sub),
+            "{\"id\":%d,\"method\":\"pearl.challenge_response\","
+            "\"params\":{\"seed\":\"%s\",\"nonce\":\"%s\"}}",
+            msg_id, seed, digest);
     }
     printf("[net] submit mode=%d json=%s\n", mode, sub); fflush(stdout);
     return send_json(sock, sub);
@@ -743,7 +754,7 @@ int main(int argc, char** argv){
 reconnect:
     if(tcp_sock >= 0){ close(tcp_sock); tcp_sock=-1; }
     if(g_submit_inflight){
-        g_submit_mode = (g_submit_mode + 1) % 3;
+        g_submit_mode = (g_submit_mode + 1) % 5;
         g_submit_inflight = 0;
         printf("[net] submit оборван; переключаю mode на %d\n", g_submit_mode);
         fflush(stdout);
@@ -773,6 +784,11 @@ reconnect:
         if(!line){
             printf("[net] Соединение потеряно, переподключаемся...\n"); fflush(stdout);
             goto reconnect;
+        }
+
+        if(strstr(line,"mining.notify")){
+            printf("[pool] mining.notify raw=%s\n", line); fflush(stdout);
+            continue;
         }
 
         if(strstr(line,"pearl.challenge")){
@@ -816,7 +832,7 @@ reconnect:
                 strncpy(g_last_share_id, share_id, sizeof(g_last_share_id)-1);
                 g_last_share_id[sizeof(g_last_share_id)-1] = 0;
                 if(!send_submit_with_mode(
-                    tcp_sock, msg_id++, g_submit_mode, cur_seed, fi, fj, dg,
+                    tcp_sock, msg_id++, g_submit_mode, wallet, cur_seed, fi, fj, dg,
                     sA_hex, sB_hex, HA_hex, HB_hex, transcript
                 )){
                     printf("[net] send submit failed\n"); fflush(stdout);
