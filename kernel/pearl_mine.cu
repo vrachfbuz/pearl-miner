@@ -429,6 +429,9 @@ static char g_seed[128]  = {0};
 static double g_diff      = 32.0;
 static volatile int g_new_job = 0;
 static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
+static int g_submit_mode = 0;      /* 0=obj-full, 1=obj-min, 2=array-min */
+static int g_submit_inflight = 0;  /* ждём result/error после submit */
+static char g_last_share_id[256] = {0}; /* seed:tile_i:tile_j:digest */
 
 static int tcp_connect(const char* host, int port){
     struct hostent* he = gethostbyname(host);
@@ -442,10 +445,15 @@ static int tcp_connect(const char* host, int port){
     return s;
 }
 
-static void send_json(int sock, const char* json){
-    char buf[2048];
+static int send_json(int sock, const char* json){
+    char buf[4096];
     snprintf(buf,sizeof(buf),"%s\n",json);
-    send(sock,buf,strlen(buf),0);
+    ssize_t n = send(sock,buf,strlen(buf),0);
+    if(n < 0){
+        perror("send");
+        return 0;
+    }
+    return 1;
 }
 
 /* Минимальный JSON-поиск строкового значения ключа */
@@ -474,6 +482,35 @@ static int  net_pos=0;
 static void bin_to_hex(const uint8_t* in, size_t n, char* out){
     for(size_t i = 0; i < n; i++) sprintf(out + i*2, "%02x", in[i]);
     out[n*2] = 0;
+}
+
+static int send_submit_with_mode(
+    int sock, int msg_id, int mode,
+    const char* seed, int tile_i, int tile_j, const char* digest,
+    const char* sA_hex, const char* sB_hex, const char* HA_hex,
+    const char* HB_hex, const char* transcript
+){
+    char sub[4096];
+    if(mode == 0){
+        snprintf(sub,sizeof(sub),
+            "{\"id\":%d,\"method\":\"pearl.submit\","
+            "\"params\":{\"seed\":\"%s\",\"tile_i\":%d,\"tile_j\":%d,"
+            "\"sA\":\"%s\",\"sB\":\"%s\",\"HA\":\"%s\",\"HB\":\"%s\","
+            "\"transcript\":\"%s\",\"digest\":\"%s\"}}",
+            msg_id, seed, tile_i, tile_j, sA_hex, sB_hex, HA_hex, HB_hex, transcript, digest);
+    } else if(mode == 1){
+        snprintf(sub,sizeof(sub),
+            "{\"id\":%d,\"method\":\"pearl.submit\","
+            "\"params\":{\"seed\":\"%s\",\"tile_i\":%d,\"tile_j\":%d,\"digest\":\"%s\"}}",
+            msg_id, seed, tile_i, tile_j, digest);
+    } else {
+        snprintf(sub,sizeof(sub),
+            "{\"id\":%d,\"method\":\"pearl.submit\","
+            "\"params\":[\"%s\",%d,%d,\"%s\"]}",
+            msg_id, seed, tile_i, tile_j, digest);
+    }
+    printf("[net] submit mode=%d json=%s\n", mode, sub); fflush(stdout);
+    return send_json(sock, sub);
 }
 
 static char* read_line(int sock){
@@ -705,6 +742,12 @@ int main(int argc, char** argv){
 
 reconnect:
     if(tcp_sock >= 0){ close(tcp_sock); tcp_sock=-1; }
+    if(g_submit_inflight){
+        g_submit_mode = (g_submit_mode + 1) % 3;
+        g_submit_inflight = 0;
+        printf("[net] submit оборван; переключаю mode на %d\n", g_submit_mode);
+        fflush(stdout);
+    }
     net_pos = 0;
     printf("[main] Подключаемся к %s:%d...\n",pool_host,pool_port);
     while(1){
@@ -719,10 +762,10 @@ reconnect:
         char msg[512];
         snprintf(msg,sizeof(msg),
             "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"pearl-cu/1.0\"]}");
-        send_json(tcp_sock, msg);
+        if(!send_json(tcp_sock, msg)) goto reconnect;
         snprintf(msg,sizeof(msg),
             "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"%s\",\"x\"]}",wallet);
-        send_json(tcp_sock, msg);
+        if(!send_json(tcp_sock, msg)) goto reconnect;
     }
 
     while(1){
@@ -764,21 +807,29 @@ reconnect:
                 bin_to_hex(HA, 32, HA_hex);
                 bin_to_hex(HB, 32, HB_hex);
                 printf("[gpu] НАЙДЕНО тайл(%d,%d) digest=%s\n",fi,fj,dg); fflush(stdout);
-                char sub[2048];
-                snprintf(sub,sizeof(sub),
-                    "{\"id\":%d,\"method\":\"pearl.submit\","
-                    "\"params\":{\"seed\":\"%s\",\"tile_i\":%d,\"tile_j\":%d,"
-                    "\"sA\":\"%s\",\"sB\":\"%s\",\"HA\":\"%s\",\"HB\":\"%s\","
-                    "\"transcript\":\"%s\",\"digest\":\"%s\"}}",
-                    msg_id++, cur_seed, fi, fj,
-                    sA_hex, sB_hex, HA_hex, HB_hex, transcript, dg);
-                send_json(tcp_sock, sub);
+                char share_id[256];
+                snprintf(share_id, sizeof(share_id), "%s:%d:%d:%s", cur_seed, fi, fj, dg);
+                if(!strcmp(share_id, g_last_share_id)){
+                    printf("[net] duplicate share, skip submit\n"); fflush(stdout);
+                    continue;
+                }
+                strncpy(g_last_share_id, share_id, sizeof(g_last_share_id)-1);
+                g_last_share_id[sizeof(g_last_share_id)-1] = 0;
+                if(!send_submit_with_mode(
+                    tcp_sock, msg_id++, g_submit_mode, cur_seed, fi, fj, dg,
+                    sA_hex, sB_hex, HA_hex, HB_hex, transcript
+                )){
+                    printf("[net] send submit failed\n"); fflush(stdout);
+                    goto reconnect;
+                }
+                g_submit_inflight = 1;
                 printf("[net] submit отправлен, ждём ответ пула...\n"); fflush(stdout);
             } else {
                 printf("[gpu] Тайл не найден\n"); fflush(stdout);
             }
         } else if(strstr(line,"result") || strstr(line,"error")){
             printf("[pool] %s\n", line); fflush(stdout);
+            g_submit_inflight = 0;
         }
     }
 
