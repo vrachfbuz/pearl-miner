@@ -118,22 +118,34 @@ static void generate_matrices(const uint8_t* sigma, int sigma_len,
     int8_t* B = (int8_t*)malloc((size_t)n * k);
     if (!A || !B) { fprintf(stderr,"OOM A/B\n"); exit(1); }
 
+    /* Генерируем A и B чанками 4MB — избегаем пика 536MB raw-буфера */
+    #define XOF_CHUNK (4*1024*1024)
     {
+        uint8_t chunk[XOF_CHUNK];
         size_t sz = (size_t)m * k;
-        uint8_t* raw = (uint8_t*)malloc(sz);
-        if (!raw) { fprintf(stderr,"OOM A raw\n"); exit(1); }
-        blake3_xof((const uint8_t*)"matrix_A", 8, sigma, sigma_len, raw, sz);
-        for (size_t x = 0; x < sz; x++) A[x] = (int8_t)((raw[x] % 128) - 64);
-        free(raw);
+        blake3_hasher h;
+        blake3_hasher_init(&h);
+        blake3_hasher_update(&h, "matrix_A", 8);
+        blake3_hasher_update(&h, sigma, sigma_len);
+        for (size_t off = 0; off < sz; off += XOF_CHUNK) {
+            size_t n2 = (off + XOF_CHUNK <= sz) ? XOF_CHUNK : sz - off;
+            blake3_hasher_finalize_seek(&h, off, chunk, n2);
+            for (size_t x = 0; x < n2; x++) A[off+x] = (int8_t)((chunk[x] % 128) - 64);
+        }
         printf("[gen] A готово\n"); fflush(stdout);
     }
     {
+        uint8_t chunk[XOF_CHUNK];
         size_t sz = (size_t)n * k;
-        uint8_t* raw = (uint8_t*)malloc(sz);
-        if (!raw) { fprintf(stderr,"OOM B raw\n"); exit(1); }
-        blake3_xof((const uint8_t*)"matrix_B", 8, sigma, sigma_len, raw, sz);
-        for (size_t x = 0; x < sz; x++) B[x] = (int8_t)((raw[x] % 128) - 64);
-        free(raw);
+        blake3_hasher h;
+        blake3_hasher_init(&h);
+        blake3_hasher_update(&h, "matrix_B", 8);
+        blake3_hasher_update(&h, sigma, sigma_len);
+        for (size_t off = 0; off < sz; off += XOF_CHUNK) {
+            size_t n2 = (off + XOF_CHUNK <= sz) ? XOF_CHUNK : sz - off;
+            blake3_hasher_finalize_seek(&h, off, chunk, n2);
+            for (size_t x = 0; x < n2; x++) B[off+x] = (int8_t)((chunk[x] % 128) - 64);
+        }
         printf("[gen] B готово\n"); fflush(stdout);
     }
 
