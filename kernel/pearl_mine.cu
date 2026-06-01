@@ -24,6 +24,7 @@
 #include <pthread.h>
 #include <time.h>
 #include <math.h>
+#include <stddef.h>
 
 extern "C" {
 #include "b3/blake3.h"
@@ -469,6 +470,56 @@ static int json_str(const char* json, const char* key, char* out, int outlen){
     out[i]=0; return 1;
 }
 
+static int hex_to_bytes(const char* hex, uint8_t* out, int out_cap){
+    int n = (int)strlen(hex);
+    if((n & 1) != 0) return 0;
+    int nb = n / 2;
+    if(nb > out_cap) return 0;
+    for(int i = 0; i < nb; i++){
+        unsigned v = 0;
+        if(sscanf(hex + i*2, "%02x", &v) != 1) return 0;
+        out[i] = (uint8_t)v;
+    }
+    return nb;
+}
+
+static int b64_encode(const uint8_t* src, int len, char* out, int out_cap){
+    static const char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int o = 0;
+    for(int i = 0; i < len; i += 3){
+        int a = src[i];
+        int b = (i + 1 < len) ? src[i + 1] : 0;
+        int c = (i + 2 < len) ? src[i + 2] : 0;
+        int triple = (a << 16) | (b << 8) | c;
+        if(o + 4 >= out_cap) return 0;
+        out[o++] = T[(triple >> 18) & 0x3F];
+        out[o++] = T[(triple >> 12) & 0x3F];
+        out[o++] = (i + 1 < len) ? T[(triple >> 6) & 0x3F] : '=';
+        out[o++] = (i + 2 < len) ? T[triple & 0x3F] : '=';
+    }
+    if(o >= out_cap) return 0;
+    out[o] = 0;
+    return o;
+}
+
+static int build_proof_blob_b64(
+    const char* seed_hex, int tile_i, int tile_j, const char* digest_hex, const char* transcript_hex,
+    char* out_b64, int out_cap
+){
+    /* Minimal binary blob v1:
+       [u32 version][u32 tile_i][u32 tile_j][32 seed][32 digest][64 transcript] */
+    uint8_t buf[4 + 4 + 4 + 32 + 32 + 64];
+    memset(buf, 0, sizeof(buf));
+    uint32_t version = 1;
+    memcpy(buf + 0, &version, 4);
+    memcpy(buf + 4, &tile_i, 4);
+    memcpy(buf + 8, &tile_j, 4);
+    if(hex_to_bytes(seed_hex, buf + 12, 32) != 32) return 0;
+    if(hex_to_bytes(digest_hex, buf + 44, 32) != 32) return 0;
+    if(hex_to_bytes(transcript_hex, buf + 76, 64) != 64) return 0;
+    return b64_encode(buf, (int)sizeof(buf), out_b64, out_cap);
+}
+
 static int extract_notify_job_id(const char* json, char* out, int outlen){
     const char* p = strstr(json, "\"params\":[");
     if(!p) return 0;
@@ -511,10 +562,15 @@ static int send_submit_with_mode(
     (void)tile_i; (void)tile_j; (void)sA_hex; (void)sB_hex; (void)HA_hex; (void)HB_hex; (void)transcript;
     char sub[4096];
     const char* jid = (job_id && job_id[0]) ? job_id : seed;
+    char proof_b64[1024];
+    if(!build_proof_blob_b64(seed, tile_i, tile_j, digest, transcript, proof_b64, sizeof(proof_b64))){
+        printf("[net] proof blob build failed\n"); fflush(stdout);
+        return 0;
+    }
     snprintf(sub,sizeof(sub),
         "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"mining.submit\","
         "\"params\":[\"%s\",\"%s\",\"%s\"]}",
-        msg_id, worker_login, jid, transcript);
+        msg_id, worker_login, jid, proof_b64);
     printf("[net] submit mode=%d json=%s\n", mode, sub); fflush(stdout);
     return send_json(sock, sub);
 }
