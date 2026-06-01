@@ -429,9 +429,10 @@ static char g_seed[128]  = {0};
 static double g_diff      = 32.0;
 static volatile int g_new_job = 0;
 static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
-static int g_submit_mode = 4;      /* fixed: pearl.challenge_response */
+static int g_submit_mode = 3;      /* fixed: jsonrpc mining.submit */
 static int g_submit_inflight = 0;  /* ждём result/error после submit */
 static char g_last_share_id[256] = {0}; /* seed:tile_i:tile_j:digest */
+static char g_last_job_id[256] = {0};
 
 static int tcp_connect(const char* host, int port){
     struct hostent* he = gethostbyname(host);
@@ -468,6 +469,21 @@ static int json_str(const char* json, const char* key, char* out, int outlen){
     out[i]=0; return 1;
 }
 
+static int extract_notify_job_id(const char* json, char* out, int outlen){
+    const char* p = strstr(json, "\"params\":[");
+    if(!p) return 0;
+    p = strchr(p, '[');
+    if(!p) return 0;
+    p++;
+    while(*p==' ' || *p=='\t') p++;
+    if(*p!='"') return 0;
+    p++;
+    int i=0;
+    while(*p && *p!='"' && i<outlen-1) out[i++]=*p++;
+    out[i]=0;
+    return i>0;
+}
+
 static double json_num(const char* json, const char* key){
     char pat[128]; snprintf(pat,sizeof(pat),"\"%s\"",key);
     const char* p = strstr(json,pat); if(!p) return 0;
@@ -494,10 +510,11 @@ static int send_submit_with_mode(
     (void)worker_login; (void)job_id; (void)incomplete_header_bytes;
     (void)tile_i; (void)tile_j; (void)sA_hex; (void)sB_hex; (void)HA_hex; (void)HB_hex; (void)transcript;
     char sub[4096];
+    const char* jid = (job_id && job_id[0]) ? job_id : seed;
     snprintf(sub,sizeof(sub),
-        "{\"id\":%d,\"method\":\"pearl.challenge_response\","
-        "\"params\":{\"seed\":\"%s\",\"nonce\":\"%s\"}}",
-        msg_id, seed, digest);
+        "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"mining.submit\","
+        "\"params\":[\"%s\",\"%s\",\"%s\"]}",
+        msg_id, worker_login, jid, transcript);
     printf("[net] submit mode=%d json=%s\n", mode, sub); fflush(stdout);
     return send_json(sock, sub);
 }
@@ -781,9 +798,18 @@ reconnect:
 
         printf("[pool-raw] %s\n", line); fflush(stdout);
 
+        if(strstr(line,"mining.notify")){
+            if(extract_notify_job_id(line, g_last_job_id, sizeof(g_last_job_id))){
+                printf("[pool] mining.notify job_id=%s\n", g_last_job_id);
+                fflush(stdout);
+            }
+        }
+
         if(strstr(line,"pearl.challenge")){
             char seed[128]={0}; double diff=32.0;
             json_str(line,"seed",seed,sizeof(seed));
+            json_str(line,"job",g_last_job_id,sizeof(g_last_job_id));
+            if(!g_last_job_id[0]) json_str(line,"job_id",g_last_job_id,sizeof(g_last_job_id));
             diff = json_num(line,"difficulty");
             if(!diff) diff=32.0;
 
@@ -827,7 +853,7 @@ reconnect:
                 strncpy(g_last_share_id, share_id, sizeof(g_last_share_id)-1);
                 g_last_share_id[sizeof(g_last_share_id)-1] = 0;
                 if(!send_submit_with_mode(
-                    tcp_sock, msg_id++, g_submit_mode, wallet, "", "", cur_seed, fi, fj, dg,
+                    tcp_sock, msg_id++, g_submit_mode, wallet, g_last_job_id, "", cur_seed, fi, fj, dg,
                     sA_hex, sB_hex, HA_hex, HB_hex, transcript
                 )){
                     printf("[net] send submit failed\n"); fflush(stdout);
