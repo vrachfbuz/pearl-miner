@@ -111,15 +111,12 @@ static void generate_matrices(const uint8_t* sigma, int sigma_len,
 {
     const int m = M_DIM, n = N_DIM, k = K_DIM, r = R_RANK;
 
-    printf("[gen] Выделяем A, B (%.1f ГБ)...\n",
+    /* Генерируем A прямо в Ap, B прямо в BpT — экономим 1 ГБ RAM.
+     * Потом добавим шум EL@ER и FL@FR прямо поверх. */
+    printf("[gen] Заполняем Ap←A, BpT←B чанками (%.1f ГБ)...\n",
            (double)(m*k + n*k) / 1e9);
     fflush(stdout);
 
-    int8_t* A = (int8_t*)malloc((size_t)m * k);
-    int8_t* B = (int8_t*)malloc((size_t)n * k);
-    if (!A || !B) { fprintf(stderr,"OOM A/B\n"); exit(1); }
-
-    /* Генерируем A и B чанками 4MB — избегаем пика 536MB raw-буфера */
     #define XOF_CHUNK (4*1024*1024)
     {
         uint8_t chunk[XOF_CHUNK];
@@ -131,7 +128,7 @@ static void generate_matrices(const uint8_t* sigma, int sigma_len,
         for (size_t off = 0; off < sz; off += XOF_CHUNK) {
             size_t n2 = (off + XOF_CHUNK <= sz) ? XOF_CHUNK : sz - off;
             blake3_hasher_finalize_seek(&h, off, chunk, n2);
-            for (size_t x = 0; x < n2; x++) A[off+x] = (int8_t)((chunk[x] % 128) - 64);
+            for (size_t x = 0; x < n2; x++) Ap[off+x] = (int8_t)((chunk[x] % 128) - 64);
         }
         printf("[gen] A готово\n"); fflush(stdout);
     }
@@ -145,7 +142,7 @@ static void generate_matrices(const uint8_t* sigma, int sigma_len,
         for (size_t off = 0; off < sz; off += XOF_CHUNK) {
             size_t n2 = (off + XOF_CHUNK <= sz) ? XOF_CHUNK : sz - off;
             blake3_hasher_finalize_seek(&h, off, chunk, n2);
-            for (size_t x = 0; x < n2; x++) B[off+x] = (int8_t)((chunk[x] % 128) - 64);
+            for (size_t x = 0; x < n2; x++) BpT[off+x] = (int8_t)((chunk[x] % 128) - 64);
         }
         printf("[gen] B готово\n"); fflush(stdout);
     }
@@ -160,8 +157,9 @@ static void generate_matrices(const uint8_t* sigma, int sigma_len,
     uint8_t kappa[32];
     blake3_concat(sigma, sigma_len, mu_bytes, 64, kappa);
 
-    blake3_keyed_hash(kappa, (const uint8_t*)A, (size_t)m*k, HA_out);
-    blake3_keyed_hash(kappa, (const uint8_t*)B, (size_t)n*k, HB_out);
+    /* HA = hash(A) = hash(Ap до шума) */
+    blake3_keyed_hash(kappa, (const uint8_t*)Ap,  (size_t)m*k, HA_out);
+    blake3_keyed_hash(kappa, (const uint8_t*)BpT, (size_t)n*k, HB_out);
 
     blake3_concat(kappa, 32, HB_out, 32, sB_out);
     blake3_concat(sB_out, 32, HA_out, 32, sA_out);
@@ -236,17 +234,17 @@ static void generate_matrices(const uint8_t* sigma, int sigma_len,
 
     /* EL@ER: для каждой строки i и столбца d:
        E[i][d] = EL[i][er_pos[d]] - EL[i][er_neg[d]]   — без вложенного r-цикла */
+    /* Ap содержит сырой A — добавляем шум EL@ER прямо поверх */
     #pragma omp parallel for schedule(static)
     for (int i = 0; i < m; i++) {
         const int8_t* eli = EL + (size_t)i * r;
-        const int8_t* ai  = A  + (size_t)i * k;
         int8_t*       api = Ap + (size_t)i * k;
         for (int d = 0; d < k; d++) {
             int32_t e = (int32_t)eli[er_pos[d]] - (int32_t)eli[er_neg[d]];
-            api[d] = clamp8((int32_t)ai[d] + e);
+            api[d] = clamp8((int32_t)api[d] + e);
         }
     }
-    free(A); free(EL); free(er_pos); free(er_neg);
+    free(EL); free(er_pos); free(er_neg);
     printf("[gen] Ap готово\n"); fflush(stdout);
 
     printf("[gen] BpT = clip(B + FL@FR) [разреженно, O(n*(r+k))]...\n");
@@ -266,12 +264,12 @@ static void generate_matrices(const uint8_t* sigma, int sigma_len,
             F_row[fl_pos[rr]] += v;
             F_row[fl_neg[rr]] -= v;
         }
-        const int8_t* bj  = B   + (size_t)j * k;
-        int8_t*       bpj = BpT + (size_t)j * k;
+        /* BpT содержит сырой B — добавляем шум FL@FR прямо поверх */
+        int8_t* bpj = BpT + (size_t)j * k;
         for (int d = 0; d < k; d++)
-            bpj[d] = clamp8((int32_t)bj[d] + F_row[d]);
+            bpj[d] = clamp8((int32_t)bpj[d] + F_row[d]);
     }
-    free(B); free(FRT); free(fl_pos); free(fl_neg);
+    free(FRT); free(fl_pos); free(fl_neg);
     printf("[gen] BpT готово\n"); fflush(stdout);
 }
 
