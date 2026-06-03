@@ -74,8 +74,8 @@ static void blake3_concat(const uint8_t* a, int alen,
  * Ref: pearl_noisygemm_reference.py / py-pearl-mining
  * ========================================================= */
 
-#define M_DIM  8192
-#define N_DIM  8192
+#define M_DIM  131072
+#define N_DIM  131072
 #define K_DIM  4096
 #define R_RANK 256
 #define TM     16
