@@ -768,6 +768,7 @@ int main(int argc, char** argv){
     const char* pool_host = "pearl.baikalmine.com";
     int         pool_port = 2010;
     const char* wallet    = NULL;
+    const char* password  = "x;d=16384"; /* RTX 2070 / CMP 40HX static difficulty */
     int         devs[MAX_GPUS] = {0};
     int         ndev = 0;
     int         observe_only = 0;
@@ -786,6 +787,7 @@ int main(int argc, char** argv){
                 }
             }
         } else if(!strcmp(argv[i],"--wallet") && i+1<argc) wallet=argv[++i];
+        else if(!strcmp(argv[i],"--password") && i+1<argc) password=argv[++i];
         else if((!strcmp(argv[i],"--device")||!strcmp(argv[i],"--devices")) && i+1<argc){
             /* "0" или "0,1,2,3" */
             const char* s = argv[++i];
@@ -808,6 +810,7 @@ int main(int argc, char** argv){
             printf("  --pool URI       stratum+tcp://host:port\n");
             printf("  --wallet ADDR    wallet.worker\n");
             printf("  --devices N[,M]  CUDA устройства (default: 0)\n");
+            printf("  --password STR   stratum пароль (default: x;d=16384 для CMP 40HX)\n");
             printf("  --observe-only   только лог входящих сообщений, без submit\n");
             printf("  --emit-proof-debug  писать proof поля в файл\n");
             printf("  --proof-debug-path  путь файла debug (default: /tmp/pearl_proof_debug.log)\n");
@@ -861,7 +864,7 @@ reconnect:
         if(!send_json(tcp_sock, msg)) goto reconnect;
         snprintf(msg,sizeof(msg),
             "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"mining.authorize\","
-            "\"params\":[\"%s\",\"x\"]}",wallet);
+            "\"params\":[\"%s\",\"%s\"]}",wallet,password);
         if(!send_json(tcp_sock, msg)) goto reconnect;
     }
 
